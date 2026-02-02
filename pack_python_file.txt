@@ -1,0 +1,41 @@
+import json
+import os
+
+
+def pack_python_files_to_json(directory, output_filename="TeamFlowApp_v_1_0_19.json", files_to_ignore=None):
+    """
+    Packs all .py files from a given directory into a single JSON file,
+    excluding files specified in files_to_ignore.
+    The JSON structure will be {filename: file_content}.
+    """
+    if files_to_ignore is None:
+        files_to_ignore = []  # Upewnij się, że lista jest pusta, jeśli nic nie podano
+
+    program_content = {}
+    try:
+        for filename in os.listdir(directory):
+            # Sprawdź, czy plik jest plikiem Pythona i nie znajduje się na liście do zignorowania
+            if filename.endswith(".py") and filename not in files_to_ignore:
+                filepath = os.path.join(directory, filename)
+                with open(filepath, "r", encoding="utf-8") as f:
+                    program_content[filename] = f.read()
+
+        with open(output_filename, "w", encoding="utf-8") as json_file:
+            json.dump(program_content, json_file, indent=4)
+        print(f"Pomyślnie spakowano {len(program_content)} plików do {output_filename}")
+        if files_to_ignore:
+            print(f"Pominięto pliki: {', '.join(files_to_ignore)}")
+    except Exception as e:
+        print(f"Wystąpił błąd podczas pakowania plików: {e}")
+
+
+# --- Jak używać ---
+
+# Przykład 1: Spakuj wszystkie pliki z bieżącego katalogu
+# pack_python_files_to_json('.')
+
+# Przykład 2: Spakuj wszystkie pliki z katalogu 'my_project_folder', pomijając 'config.py'
+# pack_python_files_to_json('my_project_folder', files_to_ignore=['config.py'])
+
+# Przykład 3: Spakuj wszystkie pliki z bieżącego katalogu, pomijając 'test_script.py' i 'temp_data.py'
+pack_python_files_to_json('.', files_to_ignore=['pack_python_file.py'])

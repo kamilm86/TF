@@ -1,0 +1,349 @@
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                               QDateEdit, QPushButton, QTableView, QLabel, QHeaderView,
+                               QProgressBar, QMessageBox, QStyledItemDelegate, QFrame, QLineEdit)
+from datetime import date
+from typing import List, Dict, Any
+from PySide6.QtCore import Qt, QDate, QThread, Signal, QAbstractTableModel, QModelIndex, QRect
+from PySide6.QtGui import QColor, QBrush, QPainter
+
+from training_data_service import TrainingDataService
+from training_details_dialog import TrainingDetailsDialog
+from training_targets_dialog import TrainingTargetsDialog
+
+class TrainingDataWorker(QThread):
+    """Worker do asynchronicznego pobierania danych szkoleniowych."""
+    data_ready = Signal(list, object) # categories, user_stats (passed as object to avoid C++ conversion issues)
+    error_occurred = Signal(str)
+
+    def __init__(self, data_provider, start_date: date, end_date: date):
+        super().__init__()
+        self.service = TrainingDataService(data_provider)
+        self.start_date = start_date
+        self.end_date = end_date
+
+    def run(self):
+        try:
+            categories, stats = self.service.fetch_training_summary(self.start_date, self.end_date)
+            self.data_ready.emit(categories, stats)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+class DashboardDelegate(QStyledItemDelegate):
+    """Delegat do rysowania pasków postępu i przycisków w Dashboardzie."""
+    
+    def paint(self, painter, option, index):
+        if index.column() == 3: # Postęp
+            # Rysowanie paska postępu
+            progress = index.data(Qt.UserRole) or 0.0
+            # Zakładamy np. max 100h jako 100% dla wizualizacji, albo po prostu pasek wypełnienia
+            # Skoro nie mamy max, rysujemy po prostu pasek proporcjonalny do np. 40h?
+            # User mock: "18/24 (75%)" -> We only have 18.
+            # Let's show just text for now, maybe a small bar background if > 0
+            
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            
+            # Tło paska (szare)
+            bar_rect = QRect(option.rect.left() + 5, option.rect.top() + 5, option.rect.width() - 10, option.rect.height() - 10)
+            painter.setBrush(QColor(60, 60, 60))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(bar_rect, 4, 4)
+            
+            # Wypełnienie (zielone/niebieskie) - mockowane nasycenie, np. logarytmicznie do 100h
+            hours = progress
+            fill_ratio = min(hours / 40.0, 1.0) # Zakładamy 40h jako "dużo"
+            fill_width = int(bar_rect.width() * fill_ratio)
+            
+            if fill_width > 0:
+                fill_rect = QRect(bar_rect.left(), bar_rect.top(), fill_width, bar_rect.height())
+                painter.setBrush(QColor(100, 200, 100)) # Greenish
+                painter.drawRoundedRect(fill_rect, 4, 4)
+            
+            # Tekst
+            text = f"{hours:.1f} h"
+            painter.setPen(Qt.white)
+            painter.drawText(bar_rect, Qt.AlignCenter, text)
+            
+            painter.restore()
+            
+        elif index.column() == 4: # Akcje
+            # Rysowanie przycisku "Oko"
+            painter.save()
+            btn_rect = QRect(option.rect.left() + 5, option.rect.top() + 2, option.rect.width() - 10, option.rect.height() - 4)
+            painter.setBrush(QColor(70, 130, 180)) # SteelBlue
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(btn_rect, 4, 4)
+            
+            painter.setPen(Qt.white)
+            painter.drawText(btn_rect, Qt.AlignCenter, "👁️ Szczegóły")
+            painter.restore()
+        else:
+            super().paint(painter, option, index)
+
+class TrainingStatusModel(QAbstractTableModel):
+    """Model danych dla Dashboardu (Level 1)."""
+    
+    def __init__(self, categories: List[str], stats: Dict[int, Dict], parent=None):
+        super().__init__(parent)
+        self.categories = categories # Lista wszystkich unikalnych kategorii
+        self.stats = stats
+        self.user_ids = sorted(stats.keys(), key=lambda uid: stats[uid].get('user_display', ''))
+        
+        self.headers = ["Pracownik", "Dział", "Kategorie", "Postęp (Suma)", "Akcje"]
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.user_ids)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+
+        user_id = self.user_ids[index.row()]
+        user_data = self.stats[user_id]
+        col = index.column()
+        
+        # Agregacja danych
+        cats_data = user_data.get('categories', {})
+        total_hours = sum(c['total_hours'] for c in cats_data.values())
+        cat_count = len(cats_data)
+        found_cats = ", ".join(sorted(cats_data.keys()))
+
+        if role == Qt.DisplayRole:
+            if col == 0: # Pracownik
+                return user_data.get('user_display', str(user_id))
+            elif col == 1: # Dział
+                return user_data.get('department', '-')
+            elif col == 2: # Kategorie
+                return f"{cat_count} kat." # ({found_cats})"
+            elif col == 3: # Postęp
+                return "" # Rysowane przez delegata
+            elif col == 4: # Akcje
+                return "" # Rysowane przez delegata
+        
+        if role == Qt.ToolTipRole:
+            if col == 2:
+                return f"Znalezione: {found_cats}"
+        
+        if role == Qt.UserRole:
+            if col == 3:
+                return total_hours # Dla delegata
+            if col == 0:
+                return user_id # ID pracownika
+
+        if role == Qt.TextAlignmentRole:
+            return Qt.AlignCenter
+
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            if 0 <= section < len(self.headers):
+                return self.headers[section]
+        return None
+
+class TrainingStatusWindow(QWidget):
+    """
+    Panel Dashboardu Szkoleniowego (Level 1).
+    Zrefaktoryzowany z QMainWindow na QWidget, aby umożliwić dokowanie.
+    """
+    def __init__(self, data_provider, parent=None):
+        super().__init__(parent)
+        self.data_provider = data_provider
+        # self.setWindowTitle("ŚCIEŻKA SZKOLENIOWA - HR REPORT") # Tytuł okna niepotrzebny w panelu
+        # self.resize(1200, 700) # Rozmiar zarzadzany przez layout
+        
+        self.worker = None
+        self.all_stats = {} # Przechowujemy pełne dane do filtrowania
+        
+        self.init_ui()
+
+    def init_ui(self):
+        """Inicjalizacja interfejsu użytkownika."""
+        # Główny layout panelu (zamiast setCentralWidget)
+        layout = QVBoxLayout(self)
+        # Marginesy dla panelu
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # --- HEADER ---
+        header_layout = QHBoxLayout()
+        layout.addLayout(header_layout)
+        
+        title = QLabel("ŚCIEŻKA SZKOLENIOWA")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #a0a0a0;")
+        header_layout.addWidget(title)
+        
+        # Przycisk Konfiguracji
+        self.btn_config = QPushButton("⚙️ Cele")
+        self.btn_config.setToolTip("Konfiguruj wymagane godziny i dni dla szkoleń")
+        self.btn_config.setFixedWidth(80)
+        self.btn_config.clicked.connect(self.open_targets_config)
+        
+        # Style przycisku (drobny styling inline)
+        self.btn_config.setStyleSheet("""
+            QPushButton {
+                background-color: #444; color: white; border: 1px solid #666; border-radius: 4px; padding: 4px;
+            }
+            QPushButton:hover { background-color: #555; }
+        """)
+        
+        header_layout.addWidget(self.btn_config)
+        
+        header_layout.addStretch()
+        
+        self.period_label = QLabel("Okres: -")
+        self.period_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        header_layout.addWidget(self.period_label)
+
+        # --- FILTERS (Level 1) ---
+        # Removed internal search bar as requested.
+        # Filtering is now handled via apply_user_filter called from Main App.
+        
+        # --- TABLE (Level 1) ---
+        
+        # --- TABLE (Level 1) ---
+        self.table_view = QTableView()
+        self.table_view.setAlternatingRowColors(True)
+        self.table_view.setSelectionBehavior(QTableView.SelectRows)
+        self.table_view.verticalHeader().setVisible(False)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_view.setShowGrid(False)
+        self.table_view.setStyleSheet("QTableView { border: none; }")
+        
+        # Delegate
+        self.delegate = DashboardDelegate()
+        self.table_view.setItemDelegate(self.delegate)
+        self.table_view.doubleClicked.connect(self.open_details)
+        
+        layout.addWidget(self.table_view)
+
+        # --- FOOTER ---
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFixedHeight(5)
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("Gotowy")
+        self.status_label.setStyleSheet("color: gray; margin-top: 5px;")
+        layout.addWidget(self.status_label)
+        # self.statusBar().addWidget(self.status_label) # Usunięte - QWidget nie ma paska stanu
+
+    def open_targets_config(self):
+        """Otwiera okno konfiguracji celów."""
+        dlg = TrainingTargetsDialog(self)
+        if dlg.exec():
+            # Jeśli zapisano zmiany, odśwież raport
+            # Musimy znać bieżący okres, aby odświeżyć. Label ma tekst "Okres: YYYY-MM"
+            # Lepiej zapisać current_start_date/end_date w self
+            if hasattr(self, 'current_start_date') and hasattr(self, 'current_end_date'):
+                self.start_report_generation(self.current_start_date, self.current_end_date)
+            else:
+                 QMessageBox.information(self, "Info", "Ustawienia zapisane. Odśwież raport ręcznie.")
+
+    def refresh_report(self, year: int, month: int):
+        """Ładuje dane."""
+        # Obliczanie zakresu dat (Cały miesiąc)
+        first_day = QDate(year, month, 1)
+        last_day = first_day.addMonths(1).addDays(-1)
+        
+        self.period_label.setText(f"Okres: {year}-{month:02d}")
+        
+        start_date = first_day.toPython()
+        end_date = last_day.toPython()
+        
+        self.start_report_generation(start_date, end_date)
+
+    def start_report_generation(self, start_date, end_date):
+        # Zapamiętaj daty do odświeżania po konfiguracji
+        self.current_start_date = start_date
+        self.current_end_date = end_date
+        
+        if self.worker and self.worker.isRunning():
+            try:
+                self.worker.data_ready.disconnect()
+                self.worker.error_occurred.disconnect()
+                self.worker.finished.disconnect()
+            except Exception:
+                pass 
+
+        self.set_loading_state(True)
+        self.status_label.setText(f"Pobieranie danych za okres {start_date} - {end_date}...")
+        
+        self.worker = TrainingDataWorker(self.data_provider, start_date, end_date)
+        self.worker.data_ready.connect(self.on_data_ready)
+        self.worker.error_occurred.connect(self.on_error)
+        self.worker.finished.connect(lambda: self.set_loading_state(False))
+        self.worker.start()
+
+    def on_data_ready(self, categories: List[str], stats: Dict):
+        self.all_stats = stats # Save for filtering
+        self.categories_list = categories
+        self.apply_user_filter(getattr(self, 'current_allowed_ids', None))
+        self.status_label.setText(f"Załadowano dane. Pracowników: {len(stats)}")
+
+    def update_user_metadata(self, metadata: Dict[int, Dict]):
+        """Aktualizuje metadane użytkowników (np. Dział) na podstawie danych z głównego okna."""
+        data_changed = False
+        for uid, meta in metadata.items():
+            if uid in self.all_stats:
+                # Merge metadata
+                self.all_stats[uid].update(meta)
+                data_changed = True
+        
+        if data_changed:
+            # Refresh model if needed, but usually this is called before or during filter apply
+            # If we are just updating metadata without changing filter list, we might need to trigger layout change
+            # But apply_user_filter re-creates the model, so it's fine if called in sequence.
+            pass
+
+    def apply_user_filter(self, allowed_user_ids: List[int] = None):
+        """Filtruje dane w tabeli na podstawie ID z głównego okna."""
+        self.current_allowed_ids = allowed_user_ids
+        
+        if allowed_user_ids is None:
+            # Pokaż wszystko
+            filtered_stats = self.all_stats
+        else:
+            allowed_set = set(allowed_user_ids)
+            filtered_stats = {
+                uid: data 
+                for uid, data in self.all_stats.items() 
+                if uid in allowed_set
+            }
+        
+        model = TrainingStatusModel(getattr(self, 'categories_list', []), filtered_stats)
+        self.table_view.setModel(model)
+
+    def on_error(self, error_msg: str):
+        self.status_label.setText("Wystąpił błąd.")
+        QMessageBox.critical(self, "Błąd", str(error_msg))
+
+    def set_loading_state(self, is_loading: bool):
+        self.progress_bar.setVisible(is_loading)
+        
+    def open_details(self, index):
+        """Otwiera szczegóły pracownika (Level 2)."""
+        if not index.isValid():
+            return
+        
+        # Pobierz User ID (ukryte w kolumnie 0 roli UserRole, lub z modelu)
+        # Model ma metodę data(UserRole)
+        # uid = index.data(Qt.UserRole) <- To może działać różnie w zależności od kolumny kliknięcia
+        
+        # Lepiej pobrać z modelu bezpośrednio, znając wiersz
+        row = index.row()
+        model = self.table_view.model()
+        # Pobieramy ID z pierwszej kolumny (gdzie jest ukryte w UserRole)
+        uid_index = model.index(row, 0)
+        uid = model.data(uid_index, Qt.UserRole)
+        
+        if uid in self.all_stats:
+            user_data = self.all_stats[uid]
+            user_name = user_data.get('user_display', 'Pracownik')
+            
+            dialog = TrainingDetailsDialog(user_name, user_data, self)
+            dialog.exec()
+        else:
+            QMessageBox.warning(self, "Brak danych", f"Nie znaleziono szczegółowych danych dla ID: {uid}")

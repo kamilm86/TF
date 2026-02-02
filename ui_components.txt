@@ -1,0 +1,257 @@
+# ui_components.py
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QGridLayout, QComboBox, QStyledItemDelegate)
+from PySide6.QtGui import QStandardItemModel, QStandardItem
+from PySide6.QtCore import Qt, Signal, QEvent
+from styles import AppStyles
+
+
+class LocationSelectionDialog(QDialog):
+    """NOWY DIALOG: Okno do wyboru lokalizacji za pomocą przycisków."""
+
+    def __init__(self, parent=None, current_theme="dark"):
+        super().__init__(parent)
+        self.current_theme = current_theme
+        self.setWindowTitle("Lokalizacja")
+        self.setModal(True)
+        self.selected_location = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+
+        self.sbc_button = QPushButton("SBC (s)")
+        self.sbc_button.clicked.connect(lambda: self.on_value_selected("s"))
+        self.przystanek_button = QPushButton("Przystanek (p)")
+        self.przystanek_button.clicked.connect(lambda: self.on_value_selected("p"))
+        self.ho_button = QPushButton("Home Office (h)")
+        self.ho_button.clicked.connect(lambda: self.on_value_selected("h"))
+
+        main_layout.addWidget(self.sbc_button)
+        main_layout.addWidget(self.przystanek_button)
+        main_layout.addWidget(self.ho_button)
+
+        self.apply_dialog_theme()
+        self.adjustSize()
+
+    def apply_dialog_theme(self):
+        self.setStyleSheet(AppStyles.get_dialog_style(self.current_theme))
+        button_style = AppStyles.get_button_style(self.current_theme)
+        self.sbc_button.setStyleSheet(button_style)
+        self.przystanek_button.setStyleSheet(button_style)
+        self.ho_button.setStyleSheet(button_style)
+
+    def on_value_selected(self, location_code):
+        self.selected_location = location_code
+        self.accept()
+
+    def get_selected_location(self):
+        return self.selected_location
+
+
+class DigitSelectionDialog(QDialog):
+    def __init__(self, parent=None, title="Wybierz wartość", values=None, current_theme="dark"):
+        super().__init__(parent)
+        self.current_theme = current_theme
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.selected_value = None
+        self.values = values if values is not None else list(range(10))
+        self.setup_ui()
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        self.grid_layout = QGridLayout();
+        self.grid_layout.setSpacing(5)
+        cols = min(6, len(self.values));
+        cols = 1 if cols == 0 else cols
+        for i, value in enumerate(self.values):
+            row, col = i // cols, i % cols
+            button = QPushButton(str(value))
+            button.setProperty("value", value)
+            button.clicked.connect(self.on_value_selected)
+            self.grid_layout.addWidget(button, row, col)
+        main_layout.addLayout(self.grid_layout)
+        self.clear_button = QPushButton("Wyczyść")
+        self.clear_button.clicked.connect(self.on_clear_selected)
+        self.cancel_button = QPushButton("Anuluj")
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.clear_button)
+        button_layout.addWidget(self.cancel_button)
+        main_layout.addLayout(button_layout)
+        self.adjustSize()
+        self.apply_dialog_theme()
+
+    def apply_dialog_theme(self):
+        self.setStyleSheet(AppStyles.get_dialog_style(self.current_theme))
+        button_style = AppStyles.get_button_style(self.current_theme)
+        for i in range(self.grid_layout.count()):
+            widget = self.grid_layout.itemAt(i).widget()
+            if isinstance(widget, QPushButton): widget.setStyleSheet(button_style)
+        self.clear_button.setStyleSheet(button_style)
+        self.cancel_button.setStyleSheet(button_style)
+
+    def on_value_selected(self):
+        self.selected_value = self.sender().property("value")
+        self.accept()
+
+    def on_clear_selected(self):
+        self.selected_value = None
+        self.accept()
+
+    def get_selected_value(self):
+        return self.selected_value
+
+
+class CustomMultiComboBox(QComboBox):
+    """Niestandardowy ComboBox z obsługa wielokrotnego wyboru (wersja poprawiona)."""
+    selection_changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._selected_items = set()
+        self._select_all_text = "-Wszystkie-"
+
+        # Konfiguracja modelu
+        self.setModel(QStandardItemModel(self))
+
+        # Konfiguracja wyglądu
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.setEditText("-Wszystkie-")
+        self.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+
+        # Używamy filtra zdarzeń do przechwytywania kliknięć, co zapobiega zamykaniu listy
+        self.view().viewport().installEventFilter(self)
+        self.lineEdit().installEventFilter(self)
+
+        # Delegat jest potrzebny do poprawnego renderowania
+        self.setItemDelegate(QStyledItemDelegate(self))
+
+    def eventFilter(self, obj, event):
+        # Przechwytujemy kliknięcie myszą w polu tekstowym, aby pokazać listę
+        if obj == self.lineEdit() and event.type() == QEvent.MouseButtonPress:
+            self.showPopup()
+            return True
+
+        # Przechwytujemy zwolnienie przycisku myszy na liście (widoku)
+        if obj == self.view().viewport() and event.type() == QEvent.MouseButtonRelease:
+            index = self.view().indexAt(event.position().toPoint())  # Użyj .position().toPoint() zamiast .pos()
+            if index.isValid():
+                self.handle_item_pressed(index)
+            return True
+
+        return False
+
+    def handle_item_pressed(self, index):
+        """Logika zaznaczania/odznaczania elementu."""
+        item = self.model().itemFromIndex(index)
+        if not item:
+            return
+
+        if item.text() == self._select_all_text:
+            # Logika dla przycisku "Zaznacz wszystkie"
+            is_checked = (item.checkState() == Qt.Checked)
+            new_state = Qt.Unchecked if is_checked else Qt.Checked
+            for i in range(1, self.model().rowCount()):
+                self.model().item(i).setCheckState(new_state)
+        else:
+            # Logika dla zwykłego elementu
+            current_state = item.checkState()
+            item.setCheckState(Qt.Checked if current_state == Qt.Unchecked else Qt.Unchecked)
+
+        self._rebuild_selected_items()
+        self.update_display_text()
+
+        self.selection_changed.emit()
+
+    def _rebuild_selected_items(self):
+        """Przebudowuje zbiór zaznaczonych elementów na podstawie stanu modelu."""
+        self._selected_items.clear()
+        all_selected = True
+        # Pętla od 1, aby pominąć element "Zaznacz wszystkie"
+        for i in range(1, self.model().rowCount()):
+            item = self.model().item(i)
+            if item.checkState() == Qt.Checked:
+                self._selected_items.add(item.text())
+            else:
+                all_selected = False
+
+        # Aktualizuj stan checkboxa "Zaznacz wszystkie"
+        if self.model().rowCount() > 0:
+            select_all_item = self.model().item(0)
+            select_all_item.setCheckState(Qt.Checked if all_selected else Qt.Unchecked)
+
+    def hidePopup(self):
+        """Aktualizuje tekst po zamknięciu listy."""
+        self.update_display_text()
+        super().hidePopup()
+
+    def add_items(self, items):
+        """Dodaje elementy do ComboBoxa."""
+        self.clear()
+
+        select_all_item = QStandardItem(self._select_all_text)
+        select_all_item.setCheckable(True)
+        self.model().appendRow(select_all_item)
+
+        for item_text in sorted(items):
+            item = QStandardItem(item_text)
+            item.setCheckable(True)
+            self.model().appendRow(item)
+
+        self.update_display_text()
+
+    def showPopup(self):
+        """Pokaż menu rozwijane z dostosowaną szerokością."""
+        super().showPopup()
+
+        width = self.view().sizeHintForColumn(0) + 20
+        width = min(width, 450)
+        self.view().setMinimumWidth(width)
+
+    def clear(self):
+        """Czyści listę elementów."""
+        self.model().clear()
+        self._selected_items.clear()
+        self.setEditText("-Wszystkie-")
+
+    def clear_selection(self):
+        """Czyści zaznaczenie wszystkich elementów i emituje sygnał o zmianie TYLKO RAZ."""
+        # Blokujemy sygnały modelu, aby nie odświeżać widoku dla każdego elementu
+        self.model().blockSignals(True)
+        try:
+            for i in range(self.model().rowCount()):
+                self.model().item(i).setCheckState(Qt.Unchecked)
+        finally:
+            self.model().blockSignals(False)
+
+        self._rebuild_selected_items()
+        self.update_display_text()
+        # Emitujemy sygnał zmiany tylko raz na koniec
+        self.selection_changed.emit()
+
+    def get_selected_items(self):
+        """Zwraca listę zaznaczonych elementów."""
+        return list(self._selected_items)
+
+    def select_items(self, items_to_select):
+        """Zaznacza programowo określone elementy na liście."""
+        lookup = set(items_to_select)
+        for i in range(1, self.model().rowCount()):
+            item = self.model().item(i)
+            if item.text() in lookup:
+                item.setCheckState(Qt.Checked)
+            else:
+                item.setCheckState(Qt.Unchecked)
+        self._rebuild_selected_items()
+        self.update_display_text()
+
+    def update_display_text(self):
+        """Aktualizuje tekst wyświetlany w comboboxie."""
+        if not self._selected_items or len(self._selected_items) == (self.model().rowCount() - 1):
+            self.setEditText("-Wszystkie-")
+        else:
+            self.setEditText(f"Wybrano {len(self._selected_items)} z {self.model().rowCount() - 1}")

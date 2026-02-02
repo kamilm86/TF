@@ -1,0 +1,191 @@
+# column_definitions.py
+from dataclasses import dataclass
+from typing import Dict, List, Any, Optional
+from enum import Enum
+
+
+class ColumnType(Enum):
+    SCHEDULE = "schedule"
+    EVENTS = "events"
+    UI_DISPLAY = "ui_display"
+
+
+class DataType(Enum):
+    STRING = str
+    INTEGER = int
+    FLOAT = float
+    BOOLEAN = bool
+
+
+@dataclass
+class ColumnDefinition:
+    id: str           # Unikalne ID w Pythonie (np. 'sched_user_id')
+    name: str         # Nazwa kolumny w SQL (np. 'Uzytkownik')
+    data_type: DataType
+    default_value: Any
+    description: str  # Opis dla użytkownika (tooltip/nagłówek)
+    width: Optional[int] = 100
+    required: bool = False
+    selectable_in_ui: bool = True
+
+
+class ColumnDefinitions:
+    """
+    Centralna definicja kolumn.
+    Atrybut 'name' MUSI pasować idealnie (wielkość liter, polskie znaki) do nazw z bazy SQL.
+    """
+
+    # --- KOLUMNY GRAFIKU (Prefix: sched_) ---
+    SCHEDULE_COLUMNS = {
+        'sched_wydzial': ColumnDefinition(
+            id='sched_wydzial', name='WydzialGrafik', data_type=DataType.STRING,
+            default_value='', description='Wydział', width=150, required=True
+        ),
+        'sched_przelozony': ColumnDefinition(
+            id='sched_przelozony', name='PrzelozonyDane', data_type=DataType.STRING,
+            default_value='', description='Przełożony (Dane)', width=150
+        ),
+        'sched_przelozony_nazwisko': ColumnDefinition(
+            id='sched_przelozony_nazwisko', name='PrzelozonyNazwiskoImie', data_type=DataType.STRING,
+            default_value='', description='Przełożony', width=100
+        ),
+        'sched_user_name': ColumnDefinition(
+            id='sched_user_name', name='NazwiskoImie', data_type=DataType.STRING,
+            default_value='', description='Imię i Nazwisko', width=150, required=True
+        ),
+        'sched_user_display': ColumnDefinition(
+            id='sched_user_display', name='UzytkownikDane', data_type=DataType.STRING,
+            default_value='', description='Pracownik', width=150, required=True
+        ),
+        'sched_user_id': ColumnDefinition(
+            id='sched_user_id', name='Uzytkownik', data_type=DataType.INTEGER,
+            default_value=0, description='ID Pracownika', width=80, required=True
+        ),
+        'sched_login': ColumnDefinition(
+            id='sched_login', name='LoginWindows', data_type=DataType.STRING,
+            default_value='', description='Login', width=100, selectable_in_ui=True
+        ),
+        'sched_nr_kadrowy': ColumnDefinition(
+            id='sched_nr_kadrowy', name='NumerKadrowy', data_type=DataType.STRING,
+            default_value='', description='Nr Kadrowy', width=80
+        ),
+        'sched_rola': ColumnDefinition(
+            id='sched_rola', name='RolaNazwa', data_type=DataType.STRING,
+            default_value='', description='Rola', width=120
+        ),
+        'sched_podrola': ColumnDefinition(
+            id='sched_podrola', name='PodRolaNazwa', data_type=DataType.STRING,
+            default_value='', description='Podrola', width=120
+        ),
+        'sched_etat': ColumnDefinition(
+            id='sched_etat', name='Etat', data_type=DataType.FLOAT,
+            default_value=1.0, description='Etat', width=60
+        ),
+        'sched_jezyk': ColumnDefinition(
+            # POPRAWKA: Zmiana 'Jezyk' na 'Język' (polski znak zgodny z bazą)
+            id='sched_jezyk', name='Język', data_type=DataType.STRING,
+            default_value='', description='Język', width=60
+        ),
+        'sched_korekta': ColumnDefinition(
+            id='sched_korekta', name='Korekta', data_type=DataType.FLOAT,
+            default_value=0, description='Korekta', width=60
+        ),
+        'sched_dtn': ColumnDefinition(
+            id='sched_dtn', name='DTN', data_type=DataType.INTEGER,
+            default_value=0, description='DTN', width=50
+        ),
+        'sched_email': ColumnDefinition(
+            id='sched_email', name='Email', data_type=DataType.STRING,
+            default_value='', description='Email', selectable_in_ui=False
+        ),
+        'sched_lokalizacja': ColumnDefinition(
+            id='sched_lokalizacja', name='LokalizacjaDomyslna', data_type=DataType.STRING,
+            default_value='', description='Lokalizacja Dom.', width=100
+        ),
+        'sched_system_pracy': ColumnDefinition(
+            id='sched_system_pracy', name='SystemCzasuPracy', data_type=DataType.STRING,
+            default_value='', description='System Pracy', width=120
+        ),
+        'sched_grafik_za_punkty': ColumnDefinition(
+            id='sched_grafik_za_punkty', name='GrafikZaPunkty', data_type=DataType.STRING,
+            default_value='', description='Grafik za punkty', width=80
+        ),
+        'sched_brak_nocki': ColumnDefinition(
+            id='sched_brak_nocki', name='BrakNocki', data_type=DataType.STRING,
+            default_value='', description='Brak nocki', width=80
+        ),
+        'sched_rka': ColumnDefinition(
+            id='sched_rka', name='Rka', data_type=DataType.STRING,
+            default_value='', description='RKA', width=50
+        ),
+        'sched_komentarz': ColumnDefinition(
+            id='sched_komentarz', name='KomentarzGrafik', data_type=DataType.STRING,
+            default_value='', description='Komentarz', width=200, selectable_in_ui=False
+        )
+    }
+
+    # --- KOLUMNY ZDARZEŃ (Prefix: evt_) ---
+    # Te nazwy pochodzą z funkcji fn_GetEventsData - sprawdź czy tam też nie ma różnic!
+    EVENTS_COLUMNS = {
+        'evt_type': ColumnDefinition(
+            id='evt_type', name='EventType', data_type=DataType.STRING,
+            default_value='', description='Typ zdarzenia', required=True
+        ),
+        'evt_id': ColumnDefinition(
+            id='evt_id', name='Id', data_type=DataType.INTEGER,
+            default_value=0, description='ID zdarzenia', required=True
+        ),
+        'evt_topic': ColumnDefinition(
+            id='evt_topic', name='Temat', data_type=DataType.STRING,
+            default_value='', description='Temat'
+        ),
+        'evt_name': ColumnDefinition(
+            id='evt_name', name='Nazwa', data_type=DataType.STRING,
+            default_value='', description='Nazwa'
+        ),
+        'evt_user_id': ColumnDefinition(
+            id='evt_user_id', name='Uzytkownik', data_type=DataType.INTEGER,
+            default_value=0, description='ID Użytkownika', required=True
+        ),
+        'evt_user_display': ColumnDefinition(
+            id='evt_user_display', name='UzytkownikDane', data_type=DataType.STRING,
+            default_value='', description='Pracownik', required=True
+        ),
+        'evt_date': ColumnDefinition(
+            id='evt_date', name='Data', data_type=DataType.STRING,
+            default_value='', description='Data', required=True
+        ),
+        'evt_time_from': ColumnDefinition(
+            id='evt_time_from', name='DataOd', data_type=DataType.STRING,
+            default_value='', description='Czas od'
+        ),
+        'evt_time_to': ColumnDefinition(
+            id='evt_time_to', name='DataDo', data_type=DataType.STRING,
+            default_value='', description='Czas do'
+        ),
+        'evt_status': ColumnDefinition(
+            id='evt_status', name='StatusNazwa', data_type=DataType.STRING,
+            default_value='', description='Status'
+        ),
+        'evt_modified_date': ColumnDefinition(
+            id='evt_modified_date', name='DataModyfikacji', data_type=DataType.STRING,
+            default_value=None, description='Data Modyfikacji'
+        )
+    }
+
+    # Domyślne kolumny widoczne
+    DEFAULT_VISIBLE_COLUMNS = ['sched_wydzial', 'sched_przelozony_nazwisko', 'sched_user_display']
+
+    @classmethod
+    def get_ui_display_columns(cls):
+        return [(col_def.id, col_def.description, col_def.width)
+                for col_def in cls.SCHEDULE_COLUMNS.values()
+                if col_def.width is not None and col_def.selectable_in_ui]
+
+    @classmethod
+    def get_required_columns(cls, column_type):
+        if column_type == ColumnType.SCHEDULE:
+            return [col_id for col_id, col_def in cls.SCHEDULE_COLUMNS.items() if col_def.required]
+        elif column_type == ColumnType.EVENTS:
+            return [col_id for col_id, col_def in cls.EVENTS_COLUMNS.items() if col_def.required]
+        return []

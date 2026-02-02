@@ -1,0 +1,1116 @@
+# data_provider.py
+
+from PySide6.QtCore import QObject, Signal
+from db_connector import DatabaseConnector
+from datetime import datetime, timedelta
+import time
+from app_settings import app_settings  # ZMIANA
+from debug_utils import debug_print, log_warning, log_error
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any, Set
+from functools import lru_cache
+from symbol_parser import parse_symbols_batch, parse_symbol
+from config import SQL_OBJECTS
+from column_definitions import ColumnDefinitions
+
+@dataclass
+class MonthlyDataContainer:
+    """Kontener na wszystkie dane miesiąca"""
+    schedule_data: List[Any]
+    events_data: List[Dict]
+    processed_data_base: Dict
+    events_cache: Dict[Tuple[int, str], List[Dict]]
+    last_updated: float
+    _icons_calculated_on_this_instance: bool = field(default=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        if not hasattr(self, 'last_updated'):
+            self.last_updated = time.time()
+
+
+class DataProvider(QObject):
+    """
+    DataProvider z ograniczonym odświeżaniem ikon
+    """
+    data_changed = Signal(str, int, int)  # Typ danych, rok, miesiąc
+
+    def __init__(self):
+        super().__init__()
+        self.db_connector = DatabaseConnector
+        self.monthly_cache: Dict[Tuple[int, int, int, int], MonthlyDataContainer] = {}
+        self.forecast_cache: Dict[Tuple[int, int], List[Dict]] = {}
+        self.audit_cache: Dict[Tuple[int, int], List[Dict]] = {}
+        self._icons_cache_by_month: Dict[Tuple[int, int], Dict[Tuple[int, str], Dict]] = {}
+        self.publish_status_cache = {}  # Pamięć podręczna dla statusu publikacji
+        # from column_mapper import ColumnMapper
+        # self.column_mapper = ColumnMapper()
+        self._current_year: Optional[int] = None
+        self._current_month: Optional[int] = None
+
+    def _fetch_suggested_off_days(self, year: int, month: int) -> Set[Tuple[str, str]]:
+        """Pobiera z bazy danych sugestie dni wolnych dla nieopublikowanego grafiku."""
+        suggestions = set()
+        try:
+            with self.db_connector.managed_connection() as conn:
+                cursor = conn.cursor()
+                query = f"EXEC {SQL_OBJECTS['p_sugestiewolne']} ?, ?"
+                cursor.execute(query, (year, month))
+                results = cursor.fetchall()
+                for row in results:
+                    if len(row) >= 2 and row[0] and row[1]:
+                        nr_kadrowy = str(row[0])
+                        date_obj = row[1]
+                        if hasattr(date_obj, 'strftime'):
+                            date_str = date_obj.strftime('%Y-%m-%d')
+                            suggestions.add((nr_kadrowy, date_str))
+
+            debug_print(f"DataProvider: Pobrano {len(suggestions)} sugestii wolnego dla {year}-{month}.")
+            return suggestions
+        except Exception as e:
+            log_error(f"Błąd podczas pobierania sugestii wolnego: {e}", exception=e)
+            return set()
+
+    def is_schedule_published(self, year: int, month: int) -> bool:
+        """Sprawdza, czy grafik na dany miesiąc jest opublikowany. Używa prostej pamięci podręcznej."""
+        cache_key = (year, month)
+        if cache_key in self.publish_status_cache:
+            return self.publish_status_cache[cache_key]
+
+        conn = None
+        try:
+            conn = self.db_connector.get_connection()
+            cursor = conn.cursor()
+            query = f"SELECT TOP 1 1 FROM {SQL_OBJECTS['datypublikacjigrafiku']} WHERE Rok=? AND Miesiac=? AND Status=1"
+            cursor.execute(query, (year, month))
+            result = cursor.fetchone()
+
+            is_published = result is not None
+            self.publish_status_cache[cache_key] = is_published
+            debug_print(f"Sprawdzono status publikacji dla {year}-{month}: {is_published}")
+            return is_published
+        except Exception as e:
+            log_error(f"Błąd podczas sprawdzania statusu publikacji dla {year}-{month}: {e}", exception=e)
+            # W przypadku błędu, dla bezpieczeństwa załóż, że jest opublikowany (wymagaj potwierdzeń)
+            return True
+        finally:
+            if conn:
+                conn.close()
+
+    def clear_publish_status_cache(self, year: int, month: int):
+        """Czyści pamięć podręczną statusu publikacji dla konkretnego miesiąca."""
+        cache_key = (year, month)
+        if cache_key in self.publish_status_cache:
+            del self.publish_status_cache[cache_key]
+            debug_print(f"Wyczyszczono cache statusu publikacji dla {year}-{month}")
+
+    def get_schedule_audit_data(self, year: int, month: int, limit: Optional[int] = None) -> List[Dict]:
+        """
+        Pobiera historię zmian grafiku, z opcjonalnym limitem TOP N.
+        Cache jest używany tylko wtedy, gdy pobierane są wszystkie dane (limit=None).
+        """
+        cache_key = (year, month)
+        # Użyj cache'a tylko, jeśli prosimy o pełny zestaw danych
+        if limit is None and cache_key in self.audit_cache:
+            debug_print(f"DataProvider: Używam cache dla danych audytowych dla {year}-{month}")
+            return self.audit_cache[cache_key]
+
+        conn = None
+        try:
+            conn = self.db_connector.get_connection()
+            cursor = conn.cursor()
+
+            # Dynamiczne budowanie zapytania w zależności od limitu
+            if limit:
+                query = f"SELECT TOP (?) * FROM {SQL_OBJECTS['fn_getscheduleauditdata']}(?, ?) ORDER BY DataModyfikacji DESC"
+                params = (limit, year, month)
+            else:
+                # Zawsze sortuj, aby zachować spójność
+                query = f"SELECT * FROM {SQL_OBJECTS['fn_getscheduleauditdata']}(?, ?) ORDER BY DataModyfikacji DESC"
+                params = (year, month)
+
+            cursor.execute(query, params)
+            columns = [column[0] for column in cursor.description]
+            data = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+            debug_print(f"Pobrano {len(data)} wierszy historii zmian dla {year}-{month} (limit: {limit})")
+
+            # Zapisz w cache'u tylko pełny wynik
+            if limit is None:
+                self.audit_cache[cache_key] = data
+
+            return data
+        except Exception as e:
+            log_error(f"Błąd podczas pobierania danych audytowych: {e}", exception=e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def clear_audit_cache(self, year: int, month: int):
+        """Czyści cache dla danych audytowych dla konkretnego miesiąca."""
+        cache_key = (year, month)
+        if cache_key in self.audit_cache:
+            del self.audit_cache[cache_key]
+            debug_print(f"DataProvider: Usunięto cache danych audytowych dla {year}-{month}")
+
+    def clear_monthly_cache(self, year: int, month: int):
+        """Czyści główny cache danych miesięcznych dla danego miesiąca."""
+        # Klucz dla `monthly_cache` to teraz (rok, miesiąc)
+        cache_key = (year, month)
+        if cache_key in self.monthly_cache:
+            del self.monthly_cache[cache_key]
+            debug_print(f"DataProvider: Usunięto z monthly_cache dla {year}-{month}")
+
+        # Klucz dla cache ikon również jest (rok, miesiąc)
+        if cache_key in self._icons_cache_by_month:
+            del self._icons_cache_by_month[cache_key]
+            debug_print(f"DataProvider: Usunięto z _icons_cache_by_month dla {year}-{month}")
+
+    def get_dynamic_icons_for_cell(self, user_id: int, date_str: str) -> Dict:
+        """
+        Zwraca ikony z cache lub oblicza je na podstawie zdarzeń.
+        WERSJA ZMODYFIKOWANA: Ikona spotkania/szkolenia (koło) jest pokazywana
+        tylko dla zdarzeń w statusie 'Delegowany'.
+        """
+        try:
+            year, month, _ = date_str.split('-')
+            year, month = int(year), int(month)
+        except:
+            return {'spotkania': 0, 'szkolenia': 0, 'nadgodziny': 0}
+
+        month_key = (year, month)
+        cell_key = (user_id, date_str)
+
+        # Sprawdź cache ikon
+        if month_key in self._icons_cache_by_month:
+            month_icons_cache = self._icons_cache_by_month[month_key]
+            if cell_key in month_icons_cache:
+                return month_icons_cache[cell_key]
+
+        # Oblicz ikony na podstawie zdarzeń (jeśli nie ma w cache)
+        container = self.monthly_cache.get(month_key)
+        events = []
+        if container and container.events_cache:
+            events = container.events_cache.get(cell_key, [])
+        else:
+            events = self.get_events_for_user_date(user_id, date_str)
+
+        # NOWA LOGIKA: Ikona koła tylko dla statusu 'Delegowany'
+        has_spotkania = any(e.get('type') == 'Spotkanie' and e.get('status') == 'Delegowany' for e in events)
+        has_szkolenia = any(e.get('type') == 'Szkolenie' and e.get('status') == 'Delegowany' for e in events)
+
+        # Logika dla nadgodzin: status nie w ['0', 'Usunięty']
+        inactive_statuses = {'0', 'Usunięty'}
+        has_nadgodziny = any(e.get('type') == 'Nadgodziny' and str(e.get('status', '1')) not in inactive_statuses for e in events)
+
+        result = {
+            'spotkania': 1 if has_spotkania else 0,
+            'szkolenia': 1 if has_szkolenia else 0,
+            'nadgodziny': 1 if has_nadgodziny else 0
+        }
+
+        # Zapisz w cache ikon
+        if month_key not in self._icons_cache_by_month:
+            self._icons_cache_by_month[month_key] = {}
+        self._icons_cache_by_month[month_key][cell_key] = result
+
+        return result
+
+    def invalidate_specific_icons(self, user_date_pairs: List[Tuple[int, str]]):
+        """
+        Wyczyszczenie cache ikon dla konkretnych par użytkownik-data.
+        Nie powinno już być potrzebne pełne czyszczenie cache miesiąca tutaj.
+        """
+        if not user_date_pairs:
+            return
+
+        affected_months = set()
+        for user_id, date_str in user_date_pairs:
+            try:
+                year, month, _ = date_str.split('-')
+                month_key = (int(year), int(month))
+                affected_months.add(month_key)
+
+                if month_key in self._icons_cache_by_month:
+                    cell_key = (user_id, date_str)
+                    if cell_key in self._icons_cache_by_month[month_key]:
+                        del self._icons_cache_by_month[month_key][cell_key]
+
+                # Zresetuj flagę obliczonych ikon dla kontenera, jeśli istnieje
+                if month_key in self.monthly_cache:
+                    self.monthly_cache[month_key]._icons_calculated_on_this_instance = False
+
+            except ValueError:
+                log_warning(f"Nieprawidłowy format daty w invalidate_specific_icons: {date_str}")
+                continue
+
+        for year, month in affected_months:
+            debug_print(f"Invalidate specific icons: Zresetowano cache ikon dla komórek w {year}-{month}")
+            self.data_changed.emit("icons", year, month)
+
+    def invalidate_icons_cache(self, year: int, month: int):
+        """
+        Czyści *tylko* cache ikon dla danego miesiąca.
+        Używane, gdy wiemy, że zdarzenia mogły się zmienić, ale dane grafiku nie.
+        """
+        month_key = (year, month)
+
+        if month_key in self._icons_cache_by_month:
+            del self._icons_cache_by_month[month_key]
+            debug_print(f"DataProvider: Wyczyścił _icons_cache_by_month dla {year}-{month}")
+
+        if month_key in self.monthly_cache:
+            # Ważne: zresetuj flagę, aby ikony zostały przeliczone przy następnym żądaniu get_processed_data
+            self.monthly_cache[month_key]._icons_calculated_on_this_instance = False
+            debug_print(f"DataProvider: Zresetował flagę _icons_calculated_on_this_instance dla {year}-{month}")
+
+            # Można też rozważyć odświeżenie events_data i events_cache w kontenerze, jeśli to konieczne
+            # np. container = self.monthly_cache[month_key]
+            # container.events_data = self._fetch_events_data(year, month)
+            # container.events_cache = self._build_events_cache(container.events_data)
+            # container.last_updated = time.time()
+
+        self.data_changed.emit("icons", year, month)
+
+    def get_forecast_data(self, year, month):
+        """Pobiera dane prognozy dla danego miesiąca."""
+        cache_key = (year, month)
+        if cache_key in self.forecast_cache:
+            debug_print(f"Używam cache dla prognozy dla {year}-{month}")
+            return self.forecast_cache[cache_key]
+
+        conn = None
+        try:
+            conn = self.db_connector.get_connection()
+            cursor = conn.cursor()
+            query = f"SELECT * FROM {SQL_OBJECTS['fn_getforecastdata']} (?, ?)"
+            cursor.execute(query, (year, month))
+
+            # Mapowanie na podstawie nazw kolumn zwróconych przez bazę
+            columns = [column[0] for column in cursor.description]
+            data = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+            debug_print(f"Pobrano {len(data)} wierszy prognozy dla {year}-{month}")
+            self.forecast_cache[cache_key] = data
+            return data
+        except Exception as e:
+            log_error(f"Błąd podczas pobierania danych prognozy: {e}", exception=e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def _get_or_load_monthly_data(self, year: int, month: int, grupa: int, funkcja: int, use_cache: bool = True) -> \
+            Optional[MonthlyDataContainer]:
+        self._current_year = year
+        self._current_month = month
+
+        cache_key = (year, month)
+
+        if use_cache and cache_key in self.monthly_cache:
+            return self.monthly_cache[cache_key]
+
+        debug_print(
+            f"DataProvider: Tworzę nowy/nadpisuję kontener dla {year}-{month} (z filtrem grupa={grupa}, funkcja={funkcja})")
+
+        conn = None
+        try:
+            # --- NOWA LOGIKA: Otwórz jedno połączenie na całą operację ---
+            conn = self.db_connector.get_connection()
+
+            # Przekaż istniejące połączenie do metod pobierających dane
+            schedule_data = self._fetch_schedule_data(year, month, grupa, funkcja, conn)
+            events_data = self._fetch_events_data(year, month, conn)
+
+            # --- POCZĄTEK POPRAWKI ---
+            # Ta logika została przypadkowo usunięta. Przywracamy ją.
+            events_cache = self._build_events_cache(events_data)
+            processed_data_base = self._build_processed_data_without_icons(schedule_data)
+
+            container = MonthlyDataContainer(
+                schedule_data=schedule_data,
+                events_data=events_data,
+                processed_data_base=processed_data_base,
+                events_cache=events_cache,
+                last_updated=time.time()
+            )
+
+            self.monthly_cache[cache_key] = container
+            debug_print(f"DataProvider: Stworzono i zapisano w cache nowy kontener dla {year}-{month}.")
+            return container
+            # --- KONIEC POPRAWKI ---
+
+        finally:
+            # --- NOWA LOGIKA: Zamknij połączenie na samym końcu ---
+            if conn:
+                conn.close()
+
+    def get_schedule_data(self, year: int, month: int, grupa: int, funkcja: int, use_cache: bool = True) -> List[Any]:
+        container = self._get_or_load_monthly_data(year, month, grupa, funkcja, use_cache)
+        return container.schedule_data if container else []
+
+    def get_events_data(self, year: int, month: int, grupa: int, funkcja: int, use_cache: bool = True) -> List[Dict]:
+        """Pobiera dane zdarzeń, używając poprawnego kontekstu filtra do załadowania kontenera."""
+        container = self._get_or_load_monthly_data(year, month, grupa, funkcja, use_cache)
+        return container.events_data if container else []
+
+    def get_processed_data(self, year: int, month: int, grupa: int, funkcja: int) -> Dict:
+        """
+        Zwraca processed_data z dynamicznie obliczonymi ikonami i sugestiami wolnego.
+        """
+        container = self._get_or_load_monthly_data(year, month, grupa, funkcja, use_cache=True)
+        if not container:
+            return {}
+
+        # --- NOWA, POPRAWIONA LOGIKA: Sugestie wolnego ---
+        # Sprawdzamy, czy sugestie zostały już zaaplikowane dla tego kontenera
+        if not getattr(container, '_suggestions_applied', False):
+            is_published = self.is_schedule_published(year, month)
+            debug_print(f"DataProvider: Status publikacji dla {year}-{month} to: {is_published}")
+            if not is_published:
+                debug_print(f"DataProvider: Grafik dla {year}-{month} nieopublikowany. Sprawdzam sugestie wolnego.")
+                suggested_off_days = self._fetch_suggested_off_days(year, month)
+                if suggested_off_days:
+                    debug_print(f"DataProvider: Znaleziono {len(suggested_off_days)} sugestii. Aplikuję do danych.")
+
+                    def _normalize_nr_kadrowy(val) -> Optional[str]:
+                        if val is None:
+                            return None
+                        s = str(val).strip()
+                        # jeśli same cyfry, porównaj po wartości liczbowej (eliminuje wiodące zera)
+                        return str(int(s)) if s.isdigit() else s.upper()
+
+                    nr_kadrowy_to_key_map = {
+                        _normalize_nr_kadrowy(data.get('sched_nr_kadrowy')): key
+                        for key, data in container.processed_data_base.items()
+                        if data.get('sched_nr_kadrowy') is not None
+                    }
+
+                    for nr_kadrowy, date_str in suggested_off_days:
+                        norm_nr = _normalize_nr_kadrowy(nr_kadrowy)
+                        user_key = nr_kadrowy_to_key_map.get(norm_nr)
+                        if not user_key:
+                            debug_print(
+                                f"Sugestia wolnego: brak dopasowania dla nr_kadrowy={nr_kadrowy!r} (norm={norm_nr!r} data={date_str}")
+                            continue
+
+                        try:
+                            day = int(date_str.split('-')[2])
+                            day_data = container.processed_data_base[user_key].setdefault('days', {}).setdefault(day,
+                                                                                                                 {})
+                            day_data['is_suggested_off'] = True
+                            # debug_print(f"DataProvider: Ustawiono is_suggested_off=True dla {nr_kadrowy} w dniu {day}")
+                        except (ValueError, IndexError, KeyError) as e:
+                            log_warning(f"Nie udało się zastosować sugestii dla {nr_kadrowy} w dniu {date_str}: {e}")
+                else:
+                    debug_print(f"DataProvider: Brak sugestii wolnego dla {year}-{month}.")
+            # Oznacz, że sugestie zostały przetworzone dla tego kontenera
+            container._suggestions_applied = True
+
+        # Sprawdź, czy ikony zostały już obliczone w tej sesji dla tego kontenera
+        if not container._icons_calculated_on_this_instance:
+            debug_print(
+                f"DataProvider: Obliczam ikony dla {year}-{month} na żądanie w get_processed_data")
+            self._update_dynamic_icons(container.processed_data_base, container.events_cache)
+            container._icons_calculated_on_this_instance = True
+
+        return container.processed_data_base
+
+    def get_department_to_group_mapping(self):
+        """
+        Zwraca słownik mapujący zagregowane grupy na zbiory wydziałów (WydzialGrafik).
+        """
+        # ZMIANA: Logika została przeniesiona do centralnego obiektu app_settings
+        return app_settings.get_group_mapping()
+
+    def refresh_data(self, year: int, month: int, grupa: int, funkcja: int):
+        """
+        Wymusza pełne odświeżenie danych dla miesiąca (np. po kliknięciu przycisku "Odśwież").
+        """
+        # ZMIANA 1: Klucz cache musi teraz uwzględniać grupę i funkcję
+        cache_key = (year, month, grupa, funkcja)
+
+        debug_print(f"DataProvider: Wymuszone odświeżenie danych dla {year}-{month} (grupa={grupa}, funkcja={funkcja})")
+
+        if cache_key in self.monthly_cache:
+            del self.monthly_cache[cache_key]
+            debug_print(f"DataProvider: Usunięto stary kontener z monthly_cache dla klucza {cache_key}")
+
+        # Klucz dla cache ikon jest niezależny od grupy/funkcji
+        icons_cache_key = (year, month)
+        if icons_cache_key in self._icons_cache_by_month:
+            del self._icons_cache_by_month[icons_cache_key]
+            debug_print(f"DataProvider: Usunięto _icons_cache_by_month dla {year}-{month}")
+
+        # ZMIANA 2: Przekaż 'grupa' i 'funkcja' do wywołania poniżej
+        container = self._get_or_load_monthly_data(year, month, grupa, funkcja, use_cache=False)
+
+        if container:
+            # Po świeżym załadowaniu, get_processed_data obliczy ikony, jeśli będzie to konieczne.
+            self.data_changed.emit("schedule", year, month)
+            self.data_changed.emit("events", year, month)
+            self.data_changed.emit("icons", year, month)
+        else:
+            log_error(f"DataProvider: Nie udało się odświeżyć danych dla {year}-{month}")
+
+    def is_schedule_published(self, year: int, month: int) -> bool:
+        """
+        Sprawdza w bazie danych, czy grafik dla danego roku i miesiąca jest opublikowany.
+        Zwraca True, jeśli jest opublikowany, False w przeciwnym razie.
+        """
+        conn = None
+        try:
+            conn = self.db_connector.get_connection()
+            cursor = conn.cursor()
+            # Używamy SQL_OBJECTS z config 
+            from config import SQL_OBJECTS
+            
+            query = f"SELECT TOP 1 Id FROM {SQL_OBJECTS['datypublikacjigrafiku']} WHERE Status=1 AND Rok=? AND Miesiac=?"
+            result = cursor.execute(query, (year, month)).fetchone()
+            return bool(result)
+        except Exception as e:
+            from debug_utils import log_error
+            log_error(f"Błąd sprawdzania statusu publikacji w DataProvider: {e}")
+            return False 
+        finally:
+            if conn:
+                conn.close()
+
+    def refresh_events_data(self, year: int, month: int):
+        """
+        Wymusza odświeżenie tylko danych o zdarzeniach (events) dla danego miesiąca,
+        zachowując resztę cache'u.
+        """
+        cache_key = (year, month)
+        container = self.monthly_cache.get(cache_key)
+
+        if not container:
+            debug_print(f"DataProvider: Brak kontenera dla {year}-{month} do odświeżenia zdarzeń. Pomijam.")
+            return
+
+        debug_print(f"DataProvider: Wymuszone odświeżenie ZDARZEŃ dla {year}-{month}.")
+        conn = None
+        try:
+            # --- NOWA LOGIKA: Użycie jednego połączenia ---
+            conn = self.db_connector.get_connection()
+            fresh_events_data = self._fetch_events_data(year, month, conn)
+            container.events_data = fresh_events_data
+            container.events_cache = self._build_events_cache(fresh_events_data)
+            container.last_updated = time.time()
+            container._icons_calculated_on_this_instance = False
+            self.data_changed.emit("events", year, month)
+        except Exception as e:
+            log_error(f"Błąd w refresh_events_data: {e}", exception=e)
+        finally:
+            if conn:
+                conn.close()
+
+    def _update_dynamic_icons(self, processed_data_target: Dict, events_cache: Dict):
+        """
+        Nakłada informacje o ikonach na dostarczony słownik `processed_data_target`.
+        """
+        if not self._current_year or not self._current_month:
+            return
+
+        # Mapa kluczy (bo processed_data_target ma klucz jako krotkę)
+        user_id_to_key_map = {key[3]: key for key in processed_data_target.keys()}
+
+        for key, user_data in processed_data_target.items():
+            user_id = key[3]
+            days_data = user_data.get('days', {})
+
+            for day, day_data_dict in days_data.items():
+                date_str = f"{self._current_year}-{self._current_month:02d}-{day:02d}"
+                events_for_cell = events_cache.get((user_id, date_str), [])
+
+                # --- LOGIKA IKON ---
+                has_spotkania = False
+                has_szkolenia = False
+                has_nadgodziny = False
+                active_events = []
+
+                for e in events_for_cell:
+                    # Pobieranie typu i statusu niezależnie od prefiksu (evt_ lub bez)
+                    e_type = e.get('evt_type') or e.get('type')
+                    e_status = e.get('evt_status') or e.get('status')
+
+                    # Filtrowanie usuniętych (status '0' lub 'Usunięty')
+                    if str(e_status) in ['0', 'Usunięty']:
+                        continue
+
+                    active_events.append(e)
+
+                    # Spotkania/Szkolenia tylko jeśli status to 'Delegowany'
+                    if e_status == 'Delegowany':
+                        if e_type == 'Spotkanie':
+                            has_spotkania = True
+                        elif e_type == 'Szkolenie':
+                            has_szkolenia = True
+
+                    # Nadgodziny zawsze jeśli aktywne
+                    if e_type == 'Nadgodziny':
+                        has_nadgodziny = True
+
+                day_data_dict['spotkania'] = 1 if has_spotkania else 0
+                day_data_dict['szkolenia'] = 1 if has_szkolenia else 0
+                day_data_dict['nadgodziny'] = 1 if has_nadgodziny else 0
+                day_data_dict['events'] = active_events
+
+        # Pętla dla nadgodzin w dni wolne - również wymaga aktualizacji logiki dla spotkań/szkoleń
+        for (user_id, date_str), events_for_cell in events_cache.items():
+            try:
+                # Sprawdzamy tylko aktywne nadgodziny (status nie w ['0', 'Usunięty'])
+                inactive_statuses = {'0', 'Usunięty'}
+                active_overtime = any(
+                    e.get('type') == 'Nadgodziny' and str(e.get('status', '1')) not in inactive_statuses for e in events_for_cell)
+                if not active_overtime:
+                    continue
+
+                user_key = user_id_to_key_map.get(user_id)
+                if not user_key:
+                    continue
+
+                user_data = processed_data_target[user_key]
+                day = int(date_str.split('-')[2])
+
+                # Dodajemy ikonę tylko, jeśli nie ma jeszcze wpisu dla tego dnia w grafiku
+                if day not in user_data.get('days', {}):
+                    day_data_dict = user_data.setdefault('days', {}).setdefault(day, {})
+                    day_data_dict['nadgodziny'] = 1
+
+                    # Utrzymujemy listę wszystkich aktywnych zdarzeń (status nie w ['0', 'Usunięty'])
+                    active_events = [e for e in events_for_cell if str(e.get('status', '1')) not in inactive_statuses]
+
+                    # NOWA LOGIKA DLA IKONY KOŁA (dla dni wolnych)
+                    day_data_dict['spotkania'] = 1 if any(
+                        e.get('type') == 'Spotkanie' and e.get('status') == 'Delegowany' for e in
+                        events_for_cell) else 0
+                    day_data_dict['szkolenia'] = 1 if any(
+                        e.get('type') == 'Szkolenie' and e.get('status') == 'Delegowany' for e in
+                        events_for_cell) else 0
+                    day_data_dict['events'] = active_events
+                    debug_print(f"Dodano ikonę nadgodzin w dniu wolnym dla user_id: {user_id}, dzień: {day}")
+
+            except (ValueError, IndexError) as e:
+                log_warning(f"Błąd przetwarzania zdarzenia dla dnia wolnego ({user_id}, {date_str}): {e}")
+                continue
+
+        debug_print(f"DataProvider (ZMODYFIKOWANA WERSJA): Zakończono _update_dynamic_icons.")
+
+    def _build_processed_data_without_icons(self, schedule_data: List[Dict]) -> Dict:
+        """
+        Przetwarza dane z już spivotowanego zapytania SQL.
+        WERSJA FINALNA UI: Wyświetla TYLKO GODZINY (Start;Czas).
+        """
+        if not self._current_year or not self._current_month or not schedule_data:
+            return {}
+
+        from app_settings import app_settings
+        # Upewnij się, że ColumnDefinitions jest zaimportowane na górze pliku!
+        cols = ColumnDefinitions.SCHEDULE_COLUMNS
+
+        processed_data = {}
+        absence_set = app_settings.get_absence_symbols()
+
+        for row_dict in schedule_data:
+            # --- POPRAWKA: Używamy .name, aby pobrać dane po nazwie SQL ---
+            uzytkownik_id = row_dict.get(cols['sched_user_id'].name, 0)
+
+            key = (
+                row_dict.get(cols['sched_wydzial'].name, ''),  # WydzialGrafik
+                row_dict.get(cols['sched_przelozony'].name, ''),  # PrzelozonyDane
+                row_dict.get(cols['sched_user_display'].name, ''),  # UzytkownikDane
+                uzytkownik_id
+            )
+            # ---------------------------------------------------------------
+
+            processed_data[key] = {
+                'days': {},
+                'total_hours': 0,
+                # Tutaj już było poprawnie, ale dla pewności pełna lista:
+                'sched_rola': row_dict.get(cols['sched_rola'].name),
+                'sched_podrola': row_dict.get(cols['sched_podrola'].name),
+                'sched_etat': row_dict.get(cols['sched_etat'].name, 0),
+                'sched_jezyk': row_dict.get(cols['sched_jezyk'].name),
+                'sched_korekta': row_dict.get(cols['sched_korekta'].name, 0),
+                'sched_dtn': row_dict.get(cols['sched_dtn'].name, 0),
+                'sched_user_name': row_dict.get(cols['sched_user_name'].name),
+                'sched_przelozony': row_dict.get(cols['sched_przelozony'].name),
+                'sched_przelozony_nazwisko': row_dict.get(cols['sched_przelozony_nazwisko'].name),
+                'sched_nr_kadrowy': row_dict.get(cols['sched_nr_kadrowy'].name, ''),
+                'sched_lokalizacja': row_dict.get(cols['sched_lokalizacja'].name),
+                'sched_komentarz': row_dict.get(cols['sched_komentarz'].name),
+                'sched_system_pracy': row_dict.get(cols['sched_system_pracy'].name),
+                'sched_grafik_za_punkty': row_dict.get(cols['sched_grafik_za_punkty'].name),
+                'sched_brak_nocki': row_dict.get(cols['sched_brak_nocki'].name),
+                'sched_user_id': uzytkownik_id,
+                'sched_login': row_dict.get(cols['sched_login'].name, ''),
+                'sched_rka': row_dict.get(cols['sched_rka'].name, ''),
+                'sched_email': row_dict.get(cols['sched_email'].name, '')
+            }
+
+            calculated_total_hours = 0
+            for day in range(1, 32):
+                symbol = row_dict.get(str(day))
+
+                if symbol is not None:
+                    parsed_symbol = parse_symbol(symbol)
+                    work_h = parsed_symbol.get('work_hours', 0) or 0
+                    calculated_total_hours += work_h
+                    start_hour = parsed_symbol.get('start_hour')
+                    spec = parsed_symbol.get('special_symbol')
+                    spec_upper = spec.upper() if spec else ""
+
+                    display_value = ""
+                    if start_hour is not None:
+                        if work_h is not None:
+                            val_float = float(work_h)
+                            val_str = str(int(val_float)) if val_float.is_integer() else str(val_float)
+                            display_value = f"{start_hour};{val_str}"
+                        else:
+                            display_value = str(start_hour)
+
+                    bg_color = None
+                    if spec_upper and (spec_upper in absence_set or spec_upper in ["OS", "U", "UZ"]):
+                        if spec_upper in ["OS", "U", "UZ"]:
+                            bg_color = "#FFFF00"
+                        else:
+                            bg_color = "#9370DB"
+                    elif start_hour is not None:
+                        try:
+                            bg_color = app_settings.SHIFT_COLOR_MAP.get(int(start_hour), "#FFFFFF")
+                        except (ValueError, TypeError):
+                            bg_color = None
+
+                    processed_data[key]['days'][day] = {
+                        'symbol': symbol, 'hours': work_h, 'start_hour': start_hour,
+                        '_display_value': display_value, '_bg_color_hex': bg_color
+                    }
+
+            processed_data[key]['total_hours'] = calculated_total_hours
+
+        debug_print(f"DataProvider: Zakończono budowanie danych (Pre-kalkulacja - Tylko Godziny).")
+        return processed_data
+
+    @lru_cache(maxsize=100)  # Cache dla kluczy miesięcy
+    def _get_month_cache_key(self, year: int, month: int) -> tuple:
+        """Cache key dla miesiąca"""
+        return (year, month)
+
+    def get_events_for_user_date(self, user_id: int, date_str: str, active_only: bool = True) -> List[Dict]:
+        """
+        Zwraca listę zdarzeń dla danego użytkownika i daty.
+        Jeśli active_only=True, zwraca tylko zdarzenia ze statusem innym niż '0'.
+        """
+        if not date_str or not user_id or date_str.count('-') != 2:
+            return []
+
+        try:
+            year, month, _ = date_str.split('-')
+            year, month = int(year), int(month)
+        except (ValueError, TypeError):
+            return []
+
+        cache_key = (year, month)
+        container = self.monthly_cache.get(cache_key)
+
+        if not container:
+            log_warning(f"DataProvider: Brak kontenera w cache dla klucza {cache_key} w get_events_for_user_date.")
+            return []
+
+        standardized_date = self._standardize_date(date_str)
+        cache_key_event = (user_id, standardized_date)
+
+        events_for_cell = container.events_cache.get(cache_key_event, [])
+
+        if not active_only:
+            return events_for_cell
+
+        # Status "aktywny" oznacza status nie w ['0', 'Usunięty']
+        # Uwaga: 'Do delegacji' i 'Delegowany' są oba "aktywne" w sensie nie-usunięte
+        # Ale ikony spotkań/szkoleń pokazują się TYLKO dla 'Delegowany'
+        inactive_statuses = {'0', 'Usunięty'}
+        active_events = [e for e in events_for_cell if str(e.get('status', '1')) not in inactive_statuses]
+        return active_events
+
+    def _fetch_schedule_data(self, year: int, month: int, grupa: int, funkcja: int, conn) -> List[Dict]:
+        """Pobiera dane grafiku z bazy, używając istniejącego połączenia."""
+        cursor = conn.cursor()
+        query = f"SELECT * FROM {SQL_OBJECTS['fn_getscheduledata']}(?, ?, ?, ?)"
+        cursor.execute(query, (year, month, grupa, funkcja))
+        columns = [column[0] for column in cursor.description]
+
+        # --- DIAGNOSTYKA: Wypisz dostępne kolumny ---
+        debug_print(f"DataProvider: Kolumny z bazy SQL: {columns}")
+        # --------------------------------------------
+
+        schedule_data = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        debug_print(f"DataProvider: Pobrane dane grafiku (nowy format): {len(schedule_data)} wierszy.")
+        return schedule_data
+
+    def _fetch_events_data(self, year: int, month: int, conn) -> List[Dict]:
+        """
+        Pobiera i mapuje zdarzenia.
+        WERSJA DIAGNOSTYCZNA: Wypisuje dostępne kolumny i szuka pracownika 'siłowo'.
+        """
+        cursor = conn.cursor()
+        from column_definitions import ColumnDefinitions
+        cols = ColumnDefinitions.EVENTS_COLUMNS
+
+        query = f"SELECT * FROM {SQL_OBJECTS['fn_geteventsdata']}(?, ?)"
+        cursor.execute(query, (year, month))
+
+        if not cursor.description:
+            return []
+
+        columns = [column[0] for column in cursor.description]
+        raw_events_as_dicts = [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+        # --- DIAGNOSTYKA: TO POKAŻE W KONSOLI PRAWDZIWE NAZWY KOLUMN ---
+        if raw_events_as_dicts:
+            first_row_keys = list(raw_events_as_dicts[0].keys())
+            debug_print(f"!!! KOLUMNY ZDARZEŃ Z SQL !!!: {first_row_keys}")
+        # ---------------------------------------------------------------
+
+        processed_events = []
+        for raw_event in raw_events_as_dicts:
+            try:
+                # --- KROK 1: BRUTE FORCE (Szukanie danych pracownika) ---
+                # Szukamy wartości w kolumnach, które mogą zawierać nazwisko
+                user_display = ""
+
+                # Lista priorytetowa znanych nazw
+                priority_keys = [
+                    cols['evt_user_display'].name,  # UzytkownikDane
+                    'NazwiskoImie',
+                    'Pracownik',
+                    'UzytkownikDane',
+                    'User',
+                    'UserName',
+                    'PracownikNazwa'
+                ]
+
+                # Najpierw sprawdź znane klucze
+                for key in priority_keys:
+                    val = raw_event.get(key)
+                    if val and str(val).strip():
+                        user_display = str(val)
+                        break
+
+                # Jeśli nadal pusto, szukaj w DOWOLNEJ kolumnie zawierającej "Nazwisko" lub "Dane" w nazwie
+                if not user_display:
+                    for key, val in raw_event.items():
+                        key_lower = key.lower()
+                        if ('nazwisko' in key_lower or 'dane' in key_lower or 'pracownik' in key_lower) and val:
+                            # Ignoruj kolumny z datami (DataModyfikacji, PrzelozonyDane itp)
+                            if 'data' not in key_lower and 'przelozony' not in key_lower:
+                                user_display = str(val)
+                                break
+                # ------------------------------------------------------
+
+                event = {
+                    'evt_type': raw_event.get(cols['evt_type'].name),
+                    'evt_id': raw_event.get(cols['evt_id'].name),
+                    'evt_topic': raw_event.get(cols['evt_topic'].name),
+                    'evt_name': raw_event.get(cols['evt_name'].name),
+                    'evt_user_id': raw_event.get(cols['evt_user_id'].name),
+
+                    'evt_user_display': user_display,  # <-- Tutaj trafi znaleziona wartość
+
+                    'evt_date': raw_event.get(cols['evt_date'].name),
+                    'evt_time_from': raw_event.get(cols['evt_time_from'].name),
+                    'evt_time_to': raw_event.get(cols['evt_time_to'].name),
+                    'evt_status': raw_event.get(cols['evt_status'].name),
+                    'evt_modified_date': raw_event.get(cols['evt_modified_date'].name)
+                }
+
+                # Dodatkowe klucze pomocnicze
+                event['user_id'] = event['evt_user_id']
+                event['date_key'] = self._standardize_date(event['evt_date'])
+                event['id'] = event['evt_id']
+                event['type'] = event['evt_type']
+
+                # Formatowanie dat/godzin
+                for key in ['evt_time_from', 'evt_time_to', 'evt_modified_date']:
+                    value = event.get(key)
+                    if hasattr(value, 'strftime'):
+                        event[key] = value.strftime('%Y-%m-%d %H:%M')
+
+                # Mapowanie starych kluczy czasowych
+                event['time_from'] = event['evt_time_from']
+                event['time_to'] = event['evt_time_to']
+
+                processed_events.append(event)
+            except Exception as e:
+                log_error(f"DataProvider: Błąd przetwarzania zdarzenia: {e}")
+                continue
+
+        debug_print(f"DataProvider: Przetworzono {len(processed_events)} zdarzeń.")
+        return processed_events
+
+    def _build_events_cache(self, events_data: List[Dict]) -> Dict[Tuple[int, str], List[Dict]]:
+        """Buduje cache zdarzeń (user_id, date_key) -> [list_of_events]"""
+        events_cache = {}
+        for event in events_data:
+            user_id = event.get('user_id')
+            date_key = self._standardize_date(event.get('date_key', ''))  # Użyj znormalizowanej daty
+
+            if user_id and date_key:
+                cache_key_event = (user_id, date_key)  # Poprawiono nazwę zmiennej
+                if cache_key_event not in events_cache:
+                    events_cache[cache_key_event] = []
+                events_cache[cache_key_event].append(event)
+        debug_print(f"DataProvider: Zbudowano events_cache z {len(events_cache)} wpisami.")
+        return events_cache
+
+    def _fetch_events_for_pairs(self, user_date_pairs: List[Tuple[int, str]], conn) -> Dict[Tuple[int, str], List[Dict]]:
+        """
+        Pobiera zdarzenia TYLKO dla konkretnych par (user_id, date_str).
+        Znacznie szybsze niż ładowanie całego miesiąca.
+        
+        Args:
+            user_date_pairs: Lista par (user_id, date_str w formacie YYYY-MM-DD)
+            conn: Aktywne połączenie z bazą danych
+            
+        Returns:
+            Dict[Tuple[int, str], List[Dict]]: {(user_id, date_str): [events]}
+        """
+        if not user_date_pairs:
+            return {}
+        
+        from column_definitions import ColumnDefinitions
+        cols = ColumnDefinitions.EVENTS_COLUMNS
+        cursor = conn.cursor()
+        result = {}
+        
+        debug_print(f"DataProvider: Pobieranie zdarzeń dla {len(user_date_pairs)} par (user_id, date)...")
+        
+        for user_id, date_str in user_date_pairs:
+            # Normalizuj datę do formatu YYYY-MM-DD
+            std_date = self._standardize_date(date_str)
+            if not std_date or std_date.count('-') != 2:
+                result[(user_id, std_date)] = []
+                continue
+            
+            year, month, day = map(int, std_date.split('-'))
+            
+            # Pobierz zdarzenia dla tej konkretnej pary używając funkcji tabelarycznej z filtrem
+            query = f"""
+                SELECT * FROM {SQL_OBJECTS['fn_geteventsdata']}(?, ?)
+                WHERE Uzytkownik = ? AND CONVERT(date, Data) = ?
+            """
+            try:
+                cursor.execute(query, (year, month, user_id, std_date))
+                
+                if not cursor.description:
+                    result[(user_id, std_date)] = []
+                    continue
+                
+                columns = [c[0] for c in cursor.description]
+                raw_rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+                
+                # Przetwórz na format wewnętrzny (podobnie jak w _fetch_events_data)
+                processed = []
+                for raw_event in raw_rows:
+                    try:
+                        # Znajdź dane użytkownika
+                        user_display = ""
+                        priority_keys = [
+                            cols['evt_user_display'].name,
+                            'NazwiskoImie', 'Pracownik', 'UzytkownikDane'
+                        ]
+                        for key in priority_keys:
+                            val = raw_event.get(key)
+                            if val and str(val).strip():
+                                user_display = str(val)
+                                break
+                        
+                        event = {
+                            'evt_type': raw_event.get(cols['evt_type'].name),
+                            'evt_id': raw_event.get(cols['evt_id'].name),
+                            'evt_topic': raw_event.get(cols['evt_topic'].name),
+                            'evt_name': raw_event.get(cols['evt_name'].name),
+                            'evt_user_id': raw_event.get(cols['evt_user_id'].name),
+                            'evt_user_display': user_display,
+                            'evt_date': raw_event.get(cols['evt_date'].name),
+                            'evt_time_from': raw_event.get(cols['evt_time_from'].name),
+                            'evt_time_to': raw_event.get(cols['evt_time_to'].name),
+                            'evt_status': raw_event.get(cols['evt_status'].name),
+                            'evt_modified_date': raw_event.get(cols['evt_modified_date'].name)
+                        }
+                        
+                        # Klucze pomocnicze
+                        event['user_id'] = event['evt_user_id']
+                        event['date_key'] = self._standardize_date(event['evt_date'])
+                        event['id'] = event['evt_id']
+                        event['type'] = event['evt_type']
+                        event['status'] = event['evt_status']
+                        
+                        # Formatowanie dat/godzin
+                        for key in ['evt_time_from', 'evt_time_to', 'evt_modified_date']:
+                            value = event.get(key)
+                            if hasattr(value, 'strftime'):
+                                event[key] = value.strftime('%Y-%m-%d %H:%M')
+                        
+                        event['time_from'] = event['evt_time_from']
+                        event['time_to'] = event['evt_time_to']
+                        
+                        processed.append(event)
+                    except Exception as e:
+                        log_error(f"DataProvider: Błąd przetwarzania zdarzenia w _fetch_events_for_pairs: {e}")
+                        continue
+                
+                result[(user_id, std_date)] = processed
+                
+            except Exception as e:
+                log_error(f"DataProvider: Błąd SQL w _fetch_events_for_pairs dla ({user_id}, {std_date}): {e}")
+                result[(user_id, std_date)] = []
+        
+        total_events = sum(len(events) for events in result.values())
+        debug_print(f"DataProvider: Pobrano {total_events} zdarzeń dla {len(user_date_pairs)} par.")
+        return result
+
+    def clear_cache(self):
+
+        """
+        Czyści cały cache danych miesięcznych i ikon.
+        Wywoływane przy starcie aplikacji lub gdy jest to absolutnie konieczne.
+        """
+        cache_count = len(self.monthly_cache)
+        icons_count = len(self._icons_cache_by_month)
+
+        self.monthly_cache.clear()
+        self._icons_cache_by_month.clear()
+
+        debug_print(
+            f"DataProvider: Wyczyszczono CAŁY cache: {cache_count} kontenerów, {icons_count} wpisów cache ikon")
+
+    def _standardize_date(self, date_obj) -> str:
+        """Standaryzuje format daty do 'YYYY-MM-DD'"""
+        if not date_obj: return ''
+        if isinstance(date_obj, str):
+            date_part = date_obj.split(' ')[0].split('T')[0]  # Weź część daty przed czasem
+            if len(date_part) == 10:
+                if date_part.count('-') == 2:  # Format YYYY-MM-DD
+                    try:  # Sprawdź czy to poprawna data
+                        datetime.strptime(date_part, '%Y-%m-%d')
+                        return date_part
+                    except ValueError:
+                        pass
+                elif date_part.count('.') == 2:  # Format DD.MM.YYYY
+                    try:
+                        d, m, y = date_part.split('.')
+                        if len(y) == 4 and len(m) == 2 and len(d) == 2:
+                            datetime.strptime(date_part, '%d.%m.%Y')  # Sprawdź poprawność
+                            return f"{y}-{m}-{d}"
+                    except ValueError:
+                        pass
+            # Jeśli nie udało się sparsować, zaloguj i zwróć pusty string lub oryginalną wartość
+            log_warning(f"DataProvider: Nie udało się znormalizować daty: '{date_obj}'")
+            return date_obj  # Lub '' jeśli preferowane jest czyszczenie niepoprawnych dat
+
+        if hasattr(date_obj, 'strftime'):  # Dla obiektów date/datetime
+            return date_obj.strftime('%Y-%m-%d')
+
+        log_warning(f"DataProvider: Nieznany typ daty do standaryzacji: {type(date_obj)}, wartość: {date_obj}")
+        return ''
+
+    def invalidate_complete_cache_for_pairs(self, user_date_pairs: List[Tuple[int, str]]):
+        """
+        Kompleksowe unieważnienie cache dla określonych par (user_id, date_str).
+        Wymusza ponowne załadowanie danych o zdarzeniach dla dotkniętych miesięcy.
+        """
+        if not user_date_pairs:
+            return
+
+        affected_months_to_refresh_events = set()
+        affected_months_for_icons_signal = set()
+
+        for user_id, date_str in user_date_pairs:
+            try:
+                std_date_str = self._standardize_date(date_str)
+                if not std_date_str or std_date_str.count('-') != 2:
+                    log_warning(
+                        f"DataProvider: Nieprawidłowy format daty w invalidate_complete_cache_for_pairs: '{date_str}'")
+                    continue
+
+                year, month, day = map(int, std_date_str.split('-'))
+                month_key = (year, month)
+
+                affected_months_to_refresh_events.add(
+                    month_key)  # Zawsze oznaczamy miesiąc do odświeżenia danych zdarzeń
+                affected_months_for_icons_signal.add(month_key)
+
+                # Unieważnij cache ikon dla konkretnej komórki
+                if month_key in self._icons_cache_by_month:
+                    cell_key = (user_id, std_date_str)
+                    if cell_key in self._icons_cache_by_month[month_key]:
+                        del self._icons_cache_by_month[month_key][cell_key]
+
+                # Zresetuj flagę obliczonych ikon dla kontenera
+                if month_key in self.monthly_cache:
+                    self.monthly_cache[month_key]._icons_calculated_on_this_instance = False
+
+            except (ValueError, TypeError) as e:
+                log_warning(
+                    f"DataProvider: Błąd w invalidate_complete_cache_for_pairs przy przetwarzaniu ({user_id}, {date_str}): {e}")
+                continue
+
+        # --- POCZĄTEK KLUCZOWEJ POPRAWKI ---
+
+        conn = None  # Zdefiniuj 'conn' na zewnątrz bloku try
+        try:
+            # Otwórz połączenie TYLKO RAZ, przed pętlą
+            conn = self.db_connector.get_connection()
+
+            for year, month in affected_months_to_refresh_events:
+                month_key_tuple = (year, month)
+                if month_key_tuple in self.monthly_cache:
+                    container = self.monthly_cache[month_key_tuple]
+                    
+                    # OPTYMALIZACJA: Pobierz zdarzenia TYLKO dla konkretnych par, nie całego miesiąca
+                    pairs_for_this_month = [
+                        (uid, ds) for uid, ds in user_date_pairs 
+                        if self._standardize_date(ds).startswith(f"{year}-{month:02d}")
+                    ]
+                    
+                    if pairs_for_this_month:
+                        debug_print(
+                            f"DataProvider: Punktowe odświeżanie {len(pairs_for_this_month)} par dla {year}-{month}.")
+                        
+                        # Pobierz tylko te zdarzenia które są potrzebne
+                        fresh_events_by_pair = self._fetch_events_for_pairs(pairs_for_this_month, conn)
+                        
+                        # Aktualizuj TYLKO te wpisy w cache (nie przebudowuj całości)
+                        for (uid, ds), events in fresh_events_by_pair.items():
+                            cache_key = (uid, ds)
+                            container.events_cache[cache_key] = events
+                            
+                            # Aktualizuj też events_data (usuń stare, dodaj nowe dla tej pary)
+                            container.events_data = [
+                                e for e in container.events_data 
+                                if not (e.get('user_id') == uid and self._standardize_date(e.get('date_key')) == ds)
+                            ]
+                            container.events_data.extend(events)
+                        
+                        container.last_updated = time.time()
+                        container._icons_calculated_on_this_instance = False
+                        
+                        debug_print(
+                            f"DataProvider: Zakończono punktowe odświeżanie dla {year}-{month}.")
+                        self.data_changed.emit("events", year, month)
+                else:
+                    debug_print(
+                        f"DataProvider: Kontener dla {year}-{month} nie istnieje w cache, zostanie załadowany przy potrzebie.")
+
+        except Exception as e:
+            log_error(f"Błąd podczas odświeżania cache zdarzeń w invalidate_complete_cache_for_pairs: {e}", exception=e)
+        finally:
+            if conn:
+                conn.close()
+                debug_print("Zamknięto połączenie w invalidate_complete_cache_for_pairs.")
+
+        for year, month in affected_months_for_icons_signal:
+            debug_print(
+                f"DataProvider: Sygnalizowanie zmiany ikon dla miesiąca {year}-{month} po invalidate_complete_cache_for_pairs.")
+            self.data_changed.emit("icons", year, month)

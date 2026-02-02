@@ -1,0 +1,343 @@
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex
+from PySide6.QtGui import QColor, QBrush
+from debug_utils import debug_print, log_warning, log_error
+
+# Definiuj stałe dla ról danych
+ROLE_DATA = Qt.UserRole
+ROLE_ID = Qt.UserRole + 1
+ROLE_TYPE = Qt.UserRole + 2
+
+class EventsTableModel(QAbstractTableModel):
+    """
+    Model danych dla tabeli zdarzeń.
+    """
+    # Definicje ról danych używanych w modelu
+    ROLE_DATA = ROLE_DATA
+    ROLE_ID = ROLE_ID
+    ROLE_TYPE = ROLE_TYPE
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data = []
+        self._filtered_data = []
+        # POPRAWNA, 11-ELEMENTOWA LISTA NAGŁÓWKÓW
+        self._column_headers = [
+            "Id", "Typ", "Temat", "Nazwa", "Użytkownik", "Data",
+            "Czas od", "Czas do", "Status", "Data Modyfikacji", "Akcje"
+        ]
+        self._column_count = len(self._column_headers)
+        self._column_to_field = {
+            0: 'evt_id',
+            1: 'evt_type',
+            2: 'evt_topic',
+            3: 'evt_name',
+            4: 'evt_user_display',  # Wcześniej user_name
+            5: 'date_key',  # Data zostaje jako date_key (sformatowana)
+            6: 'evt_time_from',
+            7: 'evt_time_to',
+            8: 'evt_status',
+            9: 'evt_modified_date'
+        }
+
+        self._display_transformers = {
+            0: str
+        }
+        self._is_dark_theme = False
+
+    def rowCount(self, parent=QModelIndex()):
+        """Zwraca liczbę wierszy w modelu"""
+        if parent.isValid():
+            return 0
+        return len(self._filtered_data)
+
+    def columnCount(self, parent=QModelIndex()):
+        """Zwraca liczbę kolumn w modelu"""
+        if parent.isValid():
+            return 0
+        return self._column_count
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid(): return None
+        row, col = index.row(), index.column()
+        if not (0 <= row < len(self._filtered_data)): return None
+
+        event = self._filtered_data[row]
+        if role == Qt.DisplayRole:
+            return self._get_display_data(event, col)
+        elif role == self.ROLE_DATA:
+            return event
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._column_headers[section]
+        return None
+
+
+    def flags(self, index):
+        """Zwraca flagi określające możliwe operacje na elemencie"""
+        if not index.isValid():
+            return Qt.NoItemFlags
+
+        # Podstawowe flagi - tylko odczyt i możliwość zaznaczenia
+        flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
+
+        return flags
+
+    # ---- Metody pomocnicze dla data() ----
+
+    def _get_display_data(self, event, col):
+        """Zwraca dane do wyświetlenia dla danej kolumny."""
+        field_name = self._column_to_field.get(col)
+        if not field_name:
+            return ""  # Dla kolumny "Akcje" lub nieznanej
+        value = event.get(field_name, '')
+        transformer = self._display_transformers.get(col)
+        return transformer(value) if transformer else value
+
+
+    def set_theme(self, is_dark_theme):
+        """Ustawia motyw (jasny/ciemny)"""
+        if self._is_dark_theme != is_dark_theme:
+            self._is_dark_theme = is_dark_theme
+            # Odśwież widok
+            self.layoutChanged.emit()
+
+    def update_data(self, events_data):
+        self.beginResetModel()
+        self._data = events_data.copy() if events_data else []
+        self._filtered_data = events_data.copy() if events_data else []
+        self.endResetModel()
+
+    def filtered_update(self, filtered_data):
+        self.beginResetModel()
+        self._filtered_data = filtered_data.copy() if filtered_data else []
+        self.endResetModel()
+
+        debug_print(
+            f"Model zdarzeń zaktualizowany (tylko filtrowane dane): {len(self._data)} zdarzeń w modelu, {len(self._filtered_data)} widocznych")
+
+    def sort(self, column, order):
+        """Sortuje dane modelu wedle wskazanej kolumny."""
+        self.layoutAboutToBeChanged.emit()
+        sort_field = self._column_to_field.get(column)
+        if not sort_field:
+            self.layoutChanged.emit()
+            return
+
+        # Domyślna wartość dla None, aby uniknąć błędów
+        default_value = 0 if column == 0 else ''
+        sort_key = lambda x: x.get(sort_field) or default_value
+
+        try:
+            self._filtered_data.sort(key=sort_key, reverse=(order == Qt.DescendingOrder))
+        except TypeError as e:
+            log_error(f"Błąd sortowania w EventsTableModel (kolumna {column}): {e}", exception=e)
+
+        self.layoutChanged.emit()
+
+
+    def filter_data(self, **filter_params):
+        """
+        Filtruje dane modelu na podstawie podanych parametrów.
+        Zoptymalizowana wersja, która aktualizuje tylko przefiltrowane dane.
+
+        Args:
+            **filter_params: Parametry filtrowania (allowed_types, topic, name, date_from, date_to)
+        """
+        try:
+            # Zapamiętaj liczbę wierszy przed filtrowaniem
+            old_row_count = len(self._filtered_data)
+
+            # Jeśli nie ma parametrów filtrowania, pokaż wszystkie dane
+            if not filter_params:
+                if len(self._filtered_data) != len(self._data):
+                    # Liczba wierszy się zmieni, wykonaj pełny reset
+                    self.beginResetModel()
+                    self._filtered_data = self._data.copy()
+                    self.endResetModel()
+                return
+
+            # Przygotuj przefiltrowane dane
+            filtered_data = []
+
+            # Klucze filtrowania
+            date_from_filter = filter_params.get('date_from')
+            date_to_filter = filter_params.get('date_to')
+            topic_filter = filter_params.get('topic', '').lower()
+            name_filter = filter_params.get('name', '').lower()
+            allowed_types_filter = filter_params.get('allowed_types')
+
+            # Użyj cache'a filtrowania jeśli istnieje i parametry się zgadzają
+            cache_key = self._generate_filter_cache_key(filter_params)
+            if hasattr(self, '_filter_cache') and cache_key in self._filter_cache:
+                filtered_data = self._filter_cache[cache_key]
+            else:
+                # Filtruj wszystkie dane według kryteriów
+                for event in self._data:
+                    event_type = event.get('evt_type')  # Było 'type'
+                    event_date_str = event.get('date_key', '')
+                    event_topic = str(event.get('evt_topic', '')).lower()  # Było 'topic'
+                    event_name = str(event.get('evt_name', '')).lower()  # Było 'name'
+
+                    # Najpierw sprawdź typ zdarzenia - najszybsze kryterium
+                    if allowed_types_filter and event_type not in allowed_types_filter:
+                        continue
+
+                    # Następnie sprawdź datę - kolejne najszybsze kryterium
+                    event_date = self._standardize_date(event_date_str)
+                    if (date_from_filter and event_date < date_from_filter) or \
+                       (date_to_filter and event_date > date_to_filter):
+                        continue
+
+                    # Na końcu sprawdź kryteria tekstowe - najwolniejsze
+                    if topic_filter and topic_filter not in event_topic:
+                        continue
+
+                    if name_filter and name_filter not in event_name:
+                        continue
+
+                    # Jeśli wszystkie kryteria są spełnione, dodaj zdarzenie do przefiltrowanych danych
+                    filtered_data.append(event)
+
+                # Zapisz w cache dla przyszłego użycia
+                if not hasattr(self, '_filter_cache'):
+                    self._filter_cache = {}
+                self._filter_cache[cache_key] = filtered_data
+
+                # Ogranicz rozmiar cache'a
+                if len(self._filter_cache) > 10:
+                    # Usuń najstarszy wpis (zakładając, że każdy nowy klucz jest dodawany na końcu)
+                    oldest_key = next(iter(self._filter_cache))
+                    del self._filter_cache[oldest_key]
+
+            # Sprawdź, czy liczba wierszy się zmieniła
+            if len(filtered_data) != old_row_count:
+                # Wykonaj pełny reset modelu
+                self.beginResetModel()
+                self._filtered_data = filtered_data
+                self.endResetModel()
+            else:
+                # Sprawdź, czy zawartość się zmieniła
+                content_changed = False
+
+                # Tworzymy słownik mapujący ID zdarzeń na indeksy wierszy dla szybszego wyszukiwania
+                event_id_map = {e.get('id'): i for i, e in enumerate(self._filtered_data) if 'id' in e}
+
+                # Sprawdź, które zdarzenia się zmieniły lub zostały zastąpione
+                changed_rows = set()
+                for i, new_event in enumerate(filtered_data):
+                    event_id = new_event.get('evt_id') # Było 'id'
+                    if event_id is not None and event_id in event_id_map:
+                        # Zdarzenie o tym ID już istnieje
+                        old_idx = event_id_map[event_id]
+
+                        # Sprawdź, czy dane zdarzenia się zmieniły
+                        if new_event != self._filtered_data[old_idx]:
+                            changed_rows.add(old_idx)
+                            content_changed = True
+                    else:
+                        # Nowe zdarzenie lub zastąpione zdarzenie
+                        content_changed = True
+                        break
+
+                if content_changed:
+                    # Zaktualizuj dane bez pełnego resetu modelu
+                    self._filtered_data = filtered_data
+
+                    # Emituj sygnały dla zmienionych wierszy
+                    for row in changed_rows:
+                        # Emituj sygnał zmiany danych dla całego wiersza
+                        left_index = self.index(row, 0)
+                        right_index = self.index(row, self.columnCount() - 1)
+                        self.dataChanged.emit(left_index, right_index)
+
+                    # Jeśli zmiana jest bardziej złożona, emituj sygnał zmiany układu
+                    if len(changed_rows) < len(filtered_data):
+                        self.layoutChanged.emit()
+
+        except Exception as e:
+            log_error(f"Błąd w filter_data: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _generate_filter_cache_key(self, filter_params):
+        """
+        Generuje klucz cache dla parametrów filtrowania.
+
+        Args:
+            filter_params: Słownik parametrów filtrowania
+
+        Returns:
+            str: Klucz cache
+        """
+        # Sortuj klucze dla spójności
+        sorted_keys = sorted(filter_params.keys())
+        key_parts = []
+
+        for key in sorted_keys:
+            value = filter_params[key]
+            if isinstance(value, list):
+                # Sortuj listy dla spójności
+                value_str = ",".join(sorted(value))
+                key_parts.append(f"{key}=[{value_str}]")
+            else:
+                key_parts.append(f"{key}={value}")
+
+        return "|".join(key_parts)
+
+    def _standardize_date(self, date_str):
+        """
+        Standaryzuje format daty do 'YYYY-MM-DD' dla porównań.
+
+        Args:
+            date_str: Data w dowolnym formacie
+
+        Returns:
+            str: Data w formacie 'YYYY-MM-DD'
+        """
+        if not date_str:
+            return ''
+
+        # Obsługa różnych formatów
+        if isinstance(date_str, str):
+            # Format 'YYYY-MM-DDThh:mm:ss'
+            if 'T' in date_str:
+                return date_str.split('T')[0]
+
+            # Format 'YYYY-MM-DD hh:mm:ss'
+            if ' ' in date_str:
+                return date_str.split(' ')[0]
+
+            # Format 'YYYY-MM-DD'
+            if len(date_str) == 10 and date_str.count('-') == 2:
+                return date_str
+
+            # Format 'DD.MM.YYYY'
+            if len(date_str) == 10 and date_str.count('.') == 2:
+                parts = date_str.split('.')
+                if len(parts) == 3:
+                    return f"{parts[2]}-{parts[1]}-{parts[0]}"
+
+        return date_str
+
+    def get_event(self, row):
+        """
+        Zwraca zdarzenie dla danego wiersza
+
+        Args:
+            row: Indeks wiersza
+
+        Returns:
+            dict: Dane zdarzenia lub None
+        """
+        if 0 <= row < len(self._filtered_data): return self._filtered_data[row]
+        return None
+
+    def get_all_events(self):
+        """Zwraca wszystkie zdarzenia"""
+        return self._data
+
+    def get_filtered_events(self):
+        """Zwraca przefiltrowane zdarzenia"""
+        return self._filtered_data

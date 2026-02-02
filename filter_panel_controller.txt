@@ -1,0 +1,592 @@
+# filter_panel_controller.py
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox, 
+                               QFrame, QSizePolicy, QGroupBox, QGridLayout, QDateEdit, QListWidget, 
+                               QLineEdit, QAbstractItemView, QMessageBox, QInputDialog, QStyle, QDialog, QScrollArea)
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor
+from PySide6.QtCore import Qt, QDate
+from ui_components import CustomMultiComboBox
+from filter_select_dialog import FilterSelectDialog
+from ui_utils import show_warning_dialog, show_info_dialog, create_clear_icon, create_settings_icon
+from debug_utils import debug_print, log_error
+
+class FilterPanelController:
+    """
+    Kontroler odpowiedzialny za lewy panel filtrów aplikacji.
+    """
+    def __init__(self, main_window):
+        self.main_window = main_window
+        # Mapowanie ID filtra -> Widget kontenera
+        self.filter_widget_map = {}
+        
+        # Ikony (cache'owane w kontrolerze lub pobierane z main_window jeśli istnieją)
+        # Przyjmijmy że tworzymy je na potrzeby kontrolera
+        self.clear_icon_dark = create_clear_icon(QColor("white"))
+        self.clear_icon_light = create_clear_icon(QColor("black"))
+
+    def setup_left_panel(self):
+        """Tworzy lewy panel z filtrami."""
+        left_panel = QWidget()
+        self.main_window.left_panel_widget = left_panel # Przypisz do main_window by reference was kept
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(5, 5, 5, 5)
+
+        # 1. Nagłówek "Zapisane filtry"
+        saved_filters_group = QGroupBox("Zapisane filtry")
+        saved_filters_layout = QVBoxLayout(saved_filters_group)
+        saved_filters_layout.setContentsMargins(5, 10, 5, 5)
+
+        # ComboBox i Przyciski w jednym rzędzie
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(2)
+        
+        # ComboBox (Stretch=1)
+        self.main_window.saved_filters_combo = QComboBox()
+        self.main_window.saved_filters_combo.addItem("") # Pusta opcja
+        self._update_saved_filters_combo()
+        self.main_window.saved_filters_combo.currentIndexChanged.connect(self._load_selected_filter_set_from_combo)
+        header_layout.addWidget(self.main_window.saved_filters_combo, 1)
+
+        # Przyciski (Stretch=0)
+        self.main_window.save_filter_button = QPushButton()
+        save_icon = self.main_window.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton)
+        self.main_window.save_filter_button.setIcon(save_icon)
+        self.main_window.save_filter_button.setFixedSize(28, 28)
+        self.main_window.save_filter_button.setToolTip("Zapisz bieżący układ filtrów (Ctrl+S)")
+        self.main_window.save_filter_button.clicked.connect(self._handle_save_button_clicked)
+        header_layout.addWidget(self.main_window.save_filter_button, 0)
+
+        self.main_window.edit_filter_button = QPushButton()
+        self.main_window.edit_filter_button.setIcon(create_settings_icon(QColor("white") if self.main_window.is_dark_theme else QColor("black")))
+        self.main_window.edit_filter_button.setToolTip("Zmień nazwę wybranego filtra")
+        self.main_window.edit_filter_button.setFixedSize(28, 24)
+        self.main_window.edit_filter_button.clicked.connect(self._rename_selected_filter_set)
+        self.main_window.edit_filter_button.setEnabled(False) 
+        header_layout.addWidget(self.main_window.edit_filter_button, 0)
+
+        self.main_window.delete_filter_button = QPushButton()
+        delete_icon = self.main_window.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+        self.main_window.delete_filter_button.setIcon(delete_icon)
+        self.main_window.delete_filter_button.setFixedSize(28, 28)
+        self.main_window.delete_filter_button.setToolTip("Usuń wybrany filtr")
+        self.main_window.delete_filter_button.clicked.connect(self._delete_selected_filter_set)
+        self.main_window.delete_filter_button.setEnabled(False)
+        header_layout.addWidget(self.main_window.delete_filter_button, 0)
+
+        saved_filters_layout.addLayout(header_layout)
+        left_layout.addWidget(saved_filters_group)
+
+
+
+        # 3. Kontener na filtry z ScrollArea
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(2)
+        
+        self.main_window.filters_layout = scroll_layout
+        
+        scroll_area.setWidget(scroll_content)
+        left_layout.addWidget(scroll_area)
+
+        # 4. Przyciski Sterujące (Footer)
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(2)
+        
+        # 4a. Przycisk "Wyczyść filtry"
+        self.main_window.clear_filters_button = QPushButton("Wyczyść filtry")
+        self.main_window.clear_filters_button.setToolTip("Resetuje wszystkie aktywne filtry")
+        self.main_window.clear_filters_button.clicked.connect(self._clear_all_filters)
+        button_layout.addWidget(self.main_window.clear_filters_button, 1) 
+
+        # 4b. Przycisk "Dodaj/Usuń Filtr"
+        self.main_window.filter_select_button = QPushButton()
+        select_icon = self.main_window.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+        self.main_window.filter_select_button.setIcon(select_icon)
+        self.main_window.filter_select_button.setFixedSize(28, 28)
+        self.main_window.filter_select_button.setToolTip("Zarządzaj widocznością filtrów")
+        self.main_window.filter_select_button.clicked.connect(self.show_filter_select_dialog)
+        button_layout.addWidget(self.main_window.filter_select_button, 0)
+        
+        left_layout.addLayout(button_layout)
+
+
+        # 4. Tworzenie widgetów filtrów (ale jeszcze nie dodawanie ich do layoutu)
+        self._create_all_filter_widgets(parent_widget=left_panel)
+
+        # 5. Aplikowanie widoczności na podstawie zapisanych ustawień
+        self._apply_filter_visibility_and_order()
+
+
+
+        return left_panel
+
+    def add_horizontal_filter(self, label_text, combo_name):
+        """Tworzy layout filtra. Zwraca (QHBoxLayout, CustomMultiComboBox, QPushButton)"""
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.setSpacing(4)
+
+        filter_label = QLabel(label_text)
+        filter_label.setFixedWidth(75)
+        filter_layout.addWidget(filter_label)
+
+        combo = CustomMultiComboBox()
+        combo.setFixedHeight(24)
+        combo.view().setMaximumWidth(240)
+        if hasattr(self.main_window, 'filter_data'):
+            combo.selection_changed.connect(self.main_window.filter_data)
+        
+        # Przypisz combo do main_window, żeby reszta kodu działała (accessed by name)
+        setattr(self.main_window, combo_name, combo)
+
+        filter_layout.addWidget(combo, 1)
+
+        clear_button = QPushButton()
+        # Ikona zależy od motywu - pobieramy z self
+        icon = self.clear_icon_dark if self.main_window.is_dark_theme else self.clear_icon_light
+        clear_button.setIcon(icon)
+        clear_button.setObjectName("FilterClearButton")
+        clear_button.setFixedSize(22, 22)
+        clear_button.setToolTip(f"Wyczyść filtr '{label_text}'")
+        clear_button.setFlat(True)
+        clear_button.clicked.connect(lambda: combo.clear_selection())
+
+        filter_layout.addWidget(clear_button, 0)
+
+        return (filter_layout, combo, clear_button)
+
+    def add_horizontal_search_filter(self, label_text, filter_name, list_widget_to_clear=None):
+        """Tworzy layout filtra wyszukiwania. Zwraca (QHBoxLayout, QLineEdit, QPushButton)"""
+        filter_layout = QHBoxLayout()
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        filter_layout.setSpacing(4)
+
+        filter_label = QLabel(label_text)
+        filter_label.setFixedWidth(75)
+        filter_layout.addWidget(filter_label)
+
+        text_edit = QLineEdit()
+        text_edit.setPlaceholderText(f"Filtruj {label_text.lower()[:-1]}...")
+        text_edit.setFixedHeight(24)
+        setattr(self.main_window, filter_name, text_edit)
+
+        filter_layout.addWidget(text_edit, 1)
+
+        clear_button = QPushButton()
+        icon = self.clear_icon_dark if self.main_window.is_dark_theme else self.clear_icon_light
+        clear_button.setIcon(icon)
+        clear_button.setObjectName("FilterClearButton")
+        clear_button.setFixedSize(22, 22)
+        clear_button.setToolTip(f"Wyczyść filtr '{label_text}'")
+        clear_button.setFlat(True)
+
+        def clear_action():
+            text_edit.blockSignals(True)
+            if list_widget_to_clear: list_widget_to_clear.blockSignals(True)
+            text_edit.clear()
+            if list_widget_to_clear: list_widget_to_clear.clearSelection()
+            text_edit.blockSignals(False)
+            if list_widget_to_clear: list_widget_to_clear.blockSignals(False)
+            self.main_window.filter_data()
+
+        clear_button.clicked.connect(clear_action)
+
+        filter_layout.addWidget(clear_button, 0)
+
+        return (filter_layout, text_edit, clear_button)
+
+    def _create_all_filter_widgets(self, parent_widget=None):
+        """Tworzy instancje wszystkich widgetów filtrów i przechowuje je w self.main_window.filter_widget_map."""
+        # Bezpośrednio modyfikujemy mapę w main_window
+        self.main_window.filter_widget_map = {}
+
+        # --- Filtr Obecności ---
+        presence_group = QGroupBox("Obecni w pracy w dniu:", parent=parent_widget)
+        presence_group.setCheckable(True)
+        presence_group.setChecked(False)
+        self.main_window.filter_by_presence_check = presence_group
+        presence_layout = QGridLayout(presence_group)
+        presence_layout.setContentsMargins(5, 10, 5, 5)
+        
+        self.main_window.presence_date_edit = QDateEdit(QDate.currentDate(), parent=presence_group)
+        self.main_window.presence_date_edit.setCalendarPopup(True)
+        self.main_window.presence_date_edit.setDisplayFormat("dd.MM.yyyy")
+        
+        self.main_window.presence_location_combo = CustomMultiComboBox(parent=presence_group)
+        self.main_window.presence_location_combo.add_items(["Home Office (h)", "SBC (s)", "Przystanek (p)", "Bez lokalizacji"])
+        
+        self.main_window.presence_hour_combo = CustomMultiComboBox(parent=presence_group)
+        self.main_window.presence_hour_combo.add_items([f"{h:02d}:00" for h in range(24)])
+        
+        presence_layout.addWidget(QLabel("Data:"), 0, 0)
+        presence_layout.addWidget(self.main_window.presence_date_edit, 0, 1)
+        presence_layout.addWidget(QLabel("Lokalizacja:"), 1, 0)
+        presence_layout.addWidget(self.main_window.presence_location_combo, 1, 1)
+        presence_layout.addWidget(QLabel("Godzina:"), 2, 0)
+        presence_layout.addWidget(self.main_window.presence_hour_combo, 2, 1)
+        
+        # Wyrównanie - etykiety minimalne, lista rozciąga się
+        presence_layout.setColumnStretch(0, 0)  # Etykiety - minimalna szerokość
+        presence_layout.setColumnStretch(1, 1)  # Listy - rozciągaj
+        presence_layout.setHorizontalSpacing(5)  # Mały odstęp
+        
+        if hasattr(self.main_window, 'filter_data'):
+            self.main_window.filter_by_presence_check.toggled.connect(self.main_window.filter_data)
+            self.main_window.filter_by_presence_check.toggled.connect(
+                lambda checked: self._handle_exclusive_filters(checked, 'presence'))
+            self.main_window.presence_date_edit.dateChanged.connect(self.main_window.filter_data)
+            self.main_window.presence_location_combo.selection_changed.connect(self.main_window.filter_data)
+            self.main_window.presence_hour_combo.selection_changed.connect(self.main_window.filter_data)
+
+        presence_group.setVisible(False)
+        self.main_window.filter_widget_map['presence'] = presence_group
+
+        # --- Filtr Nieobecności ---
+        absence_group = QGroupBox("Nieobecni w pracy w dniu:", parent=parent_widget)
+        absence_group.setCheckable(True)
+        absence_group.setChecked(False)
+        self.main_window.filter_by_absence_check = absence_group
+
+        absence_layout = QGridLayout(absence_group)
+        absence_layout.setContentsMargins(5, 10, 5, 5)
+
+        self.main_window.absence_date_edit = QDateEdit(QDate.currentDate(), parent=absence_group)
+        self.main_window.absence_date_edit.setCalendarPopup(True)
+        self.main_window.absence_date_edit.setDisplayFormat("dd.MM.yyyy")
+
+        self.main_window.absence_symbol_combo = CustomMultiComboBox(parent=absence_group)
+        self.main_window.absence_hour_combo = CustomMultiComboBox(parent=absence_group)
+        self.main_window.absence_hour_combo.add_items([f"{h:02d}:00" for h in range(24)])
+
+        absence_layout.addWidget(QLabel("Data:"), 0, 0)
+        absence_layout.addWidget(self.main_window.absence_date_edit, 0, 1)
+        absence_layout.addWidget(QLabel("Symbol:"), 1, 0)
+        absence_layout.addWidget(self.main_window.absence_symbol_combo, 1, 1)
+        absence_layout.addWidget(QLabel("Godzina rozp.:"), 2, 0)
+        absence_layout.addWidget(self.main_window.absence_hour_combo, 2, 1)
+        
+        # Wyrównanie - etykiety minimalne, lista rozciąga się
+        absence_layout.setColumnStretch(0, 0)  # Etykiety - minimalna szerokość
+        absence_layout.setColumnStretch(1, 1)  # Listy - rozciągaj
+        absence_layout.setHorizontalSpacing(5)  # Mały odstęp
+
+        if hasattr(self.main_window, 'filter_data'):
+            self.main_window.filter_by_absence_check.toggled.connect(self.main_window.filter_data)
+            self.main_window.filter_by_absence_check.toggled.connect(
+                lambda checked: self._handle_exclusive_filters(checked, 'absence'))
+            self.main_window.absence_date_edit.dateChanged.connect(self.main_window.filter_data)
+            self.main_window.absence_symbol_combo.selection_changed.connect(self.main_window.filter_data)
+            self.main_window.absence_hour_combo.selection_changed.connect(self.main_window.filter_data)
+
+        absence_group.setVisible(False)
+        self.main_window.filter_widget_map['absence'] = absence_group
+
+        # --- Separator ---
+        separator = QFrame(parent=parent_widget)
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        separator.setVisible(False)
+        self.main_window.filter_widget_map['separator1'] = separator
+
+        # --- Pozostałe filtry standardowe ---
+        filter_definitions = [
+            ("Grupa:", "grupa_main_filter_combo", "grupa"),
+            ("Wydział:", "wydzial_combo", "wydzial"),
+            ("LD:", "default_location_combo", "default_location"),
+            ("System Pracy:", "system_czasu_pracy_combo", "system_czasu_pracy"),
+            ("Rola:", "rola_combo", "rola"),
+            ("PodRola:", "podrola_combo", "podrola"),
+            ("Język:", "jezyk_combo", "jezyk"),
+            ("Etat:", "etat_combo", "etat"),
+            ("DTN:", "dtn_combo", "dtn"),
+            ("Rka:", "rka_combo", "rka"),
+            ("Grafik za pkt:", "grafik_za_punkty_combo", "sched_grafik_za_punkty"),
+            ("Brak nocki:", "brak_nocki_combo", "sched_brak_nocki")
+        ]
+
+        for label, combo_name, f_id in filter_definitions:
+            layout, combo, btn = self.add_horizontal_filter(label, combo_name)
+            
+            container_widget = QWidget(parent=parent_widget)
+            
+            # Reparenting
+            combo.setParent(container_widget)
+            btn.setParent(container_widget)
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item and item.widget():
+                    item.widget().setParent(container_widget)
+
+            container_widget.setLayout(layout)
+            container_widget.setVisible(False)
+            self.main_window.filter_widget_map[f_id] = container_widget
+
+        # --- Filtry złożone (Przełożony, Użytkownik) ---
+        
+        # Przełożony
+        przelozony_widget = QWidget(parent=parent_widget)
+        przelozony_v_layout = QVBoxLayout(przelozony_widget)
+        przelozony_v_layout.setContentsMargins(0, 0, 0, 0)
+        przelozony_v_layout.setSpacing(4)
+        
+        self.main_window.przelozony_list = QListWidget(parent=przelozony_widget)
+        self.main_window.przelozony_list.setMaximumHeight(150)
+        
+        search_layout, self.main_window.przelozony_filter, clear_btn = self.add_horizontal_search_filter(
+            "Przełożony:", "przelozony_filter", list_widget_to_clear=self.main_window.przelozony_list)
+
+        # Reparenting
+        self.main_window.przelozony_filter.setParent(przelozony_widget)
+        clear_btn.setParent(przelozony_widget)
+        for i in range(search_layout.count()):
+            item = search_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().setParent(przelozony_widget)
+
+        przelozony_v_layout.addLayout(search_layout)
+
+        if hasattr(self.main_window, 'filter_przelozony_list'):
+            self.main_window.przelozony_filter.textChanged.connect(self.main_window.filter_przelozony_list)
+        self.main_window.przelozony_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if hasattr(self.main_window, 'filter_data'):
+            self.main_window.przelozony_list.itemSelectionChanged.connect(self.main_window.filter_data)
+        przelozony_v_layout.addWidget(self.main_window.przelozony_list)
+        
+        przelozony_widget.setVisible(False)
+        self.main_window.filter_widget_map['przelozony'] = przelozony_widget
+
+        # Użytkownik
+        uzytkownik_widget = QWidget(parent=parent_widget)
+        uzytkownik_v_layout = QVBoxLayout(uzytkownik_widget)
+        uzytkownik_v_layout.setContentsMargins(0, 0, 0, 0)
+        uzytkownik_v_layout.setSpacing(4)
+        
+        self.main_window.uzytkownik_list = QListWidget(parent=uzytkownik_widget)
+        self.main_window.uzytkownik_list.setMaximumHeight(150)
+        
+        search_layout, self.main_window.uzytkownik_filter, clear_btn = self.add_horizontal_search_filter(
+            "Użytkownik:", "uzytkownik_filter", list_widget_to_clear=self.main_window.uzytkownik_list)
+
+        # Reparenting
+        self.main_window.uzytkownik_filter.setParent(uzytkownik_widget)
+        clear_btn.setParent(uzytkownik_widget)
+        for i in range(search_layout.count()):
+             item = search_layout.itemAt(i)
+             if item and item.widget():
+                 item.widget().setParent(uzytkownik_widget)
+
+        uzytkownik_v_layout.addLayout(search_layout)
+
+        if hasattr(self.main_window, 'filter_uzytkownik_list'):
+            self.main_window.uzytkownik_filter.textChanged.connect(self.main_window.filter_uzytkownik_list)
+        self.main_window.uzytkownik_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if hasattr(self.main_window, 'filter_data'):
+            self.main_window.uzytkownik_list.itemSelectionChanged.connect(self.main_window.filter_data)
+        uzytkownik_v_layout.addWidget(self.main_window.uzytkownik_list)
+        
+        uzytkownik_widget.setVisible(False)
+        self.main_window.filter_widget_map['uzytkownik'] = uzytkownik_widget
+
+    def _apply_filter_visibility_and_order(self):
+        """Przebudowuje layout filtrów."""
+        layout = self.main_window.filters_layout
+        widget_map = self.main_window.filter_widget_map
+        visible_list = self.main_window.visible_filters_list
+
+        if not layout or not widget_map:
+            return
+
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setVisible(False)
+
+        for filter_id in visible_list:
+            widget = widget_map.get(filter_id)
+            if widget:
+                layout.addWidget(widget)
+                widget.setVisible(True)
+
+        layout.addStretch()
+
+    def _handle_exclusive_filters(self, checked, filter_type):
+        """Obsługa wykluczania się filtrów obecności/nieobecności."""
+        if not checked:
+            return
+        
+        if filter_type == 'presence':
+             if self.main_window.filter_by_absence_check.isChecked():
+                 self.main_window.filter_by_absence_check.blockSignals(True)
+                 self.main_window.filter_by_absence_check.setChecked(False)
+                 self.main_window.filter_by_absence_check.blockSignals(False)
+        elif filter_type == 'absence':
+             if self.main_window.filter_by_presence_check.isChecked():
+                 self.main_window.filter_by_presence_check.blockSignals(True)
+                 self.main_window.filter_by_presence_check.setChecked(False)
+                 self.main_window.filter_by_presence_check.blockSignals(False)
+
+    def _update_saved_filters_combo(self):
+        """Aktualizuje listę zapisanych filtrów w ComboBox."""
+        saved_filters = self.main_window.user_app_settings.get('saved_filters', {})
+        combo = self.main_window.saved_filters_combo
+        
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("") # Pusta opcja
+
+        if saved_filters:
+            for name in sorted(saved_filters.keys()):
+                combo.addItem(name)
+
+        combo.blockSignals(False)
+        combo.setCurrentIndex(0)
+        self._update_delete_button_state()
+
+    def _update_delete_button_state(self, index=None):
+        """Aktualizuje stan przycisków edycji/usuwania filtra."""
+        is_filter_selected = self.main_window.saved_filters_combo.currentIndex() > 0
+        if hasattr(self.main_window, 'delete_filter_button'):
+            self.main_window.delete_filter_button.setEnabled(is_filter_selected)
+        if hasattr(self.main_window, 'edit_filter_button'):
+            self.main_window.edit_filter_button.setEnabled(is_filter_selected)
+
+    def _load_selected_filter_set_from_combo(self, index):
+        """Wczytuje zestaw filtrów po wybraniu go z listy."""
+        if index == 0:
+            self._update_delete_button_state()
+            return
+
+        filter_name = self.main_window.saved_filters_combo.itemText(index)
+        saved_filters = self.main_window.user_app_settings.get('saved_filters', {})
+        filter_state = saved_filters.get(filter_name)
+
+        if filter_state:
+            debug_print(f"Automatyczne wczytywanie zestawu filtrów: '{filter_name}'")
+            if hasattr(self.main_window, 'restore_filters_state'):
+                self.main_window.restore_filters_state(filter_state)
+        else:
+            log_error(f"Nie znaleziono zapisanego stanu dla filtra '{filter_name}'.")
+            self.main_window.saved_filters_combo.setCurrentIndex(0)
+
+    def _handle_save_button_clicked(self):
+        """Obsługa zapisu filtra."""
+        current_index = self.main_window.saved_filters_combo.currentIndex()
+        filter_name = self.main_window.saved_filters_combo.currentText()
+        current_state = self.main_window.get_current_filters_state() # Zakładamy że metoda istnieje
+
+        if current_index == 0 or not filter_name:
+            self._create_new_filter_set(current_state)
+        else:
+            reply = QMessageBox.question(self.main_window, "Aktualizacja filtru",
+                                         f"Czy chcesz zaktualizować filtr '{filter_name}'?",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.main_window.user_app_settings['saved_filters'][filter_name] = current_state
+                self.main_window.settings_db.save_settings(self.main_window.user_app_settings)
+                QMessageBox.information(self.main_window, "Zaktualizowano", "Filtr zaktualizowany.")
+
+    def _create_new_filter_set(self, current_state):
+        """Tworzenie nowego zestawu filtrów."""
+        filter_name, ok = QInputDialog.getText(self.main_window, "Zapisz nowy zestaw", "Podaj nazwę:")
+        if ok and filter_name:
+            if filter_name in self.main_window.user_app_settings.get('saved_filters', {}):
+                 QMessageBox.warning(self.main_window, "Błąd", "Taka nazwa już istnieje.")
+                 return
+            
+            if 'saved_filters' not in self.main_window.user_app_settings:
+                self.main_window.user_app_settings['saved_filters'] = {}
+            
+            self.main_window.user_app_settings['saved_filters'][filter_name] = current_state
+            self.main_window.settings_db.save_settings(self.main_window.user_app_settings)
+            self._update_saved_filters_combo()
+            self.main_window.saved_filters_combo.setCurrentText(filter_name)
+    
+    def _delete_selected_filter_set(self):
+         filter_name = self.main_window.saved_filters_combo.currentText()
+         if not filter_name: return
+         
+         reply = QMessageBox.question(self.main_window, "Usuwanie", f"Usunąć filtr '{filter_name}'?", 
+                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+         if reply == QMessageBox.Yes:
+             del self.main_window.user_app_settings['saved_filters'][filter_name]
+             self.main_window.settings_db.save_settings(self.main_window.user_app_settings)
+             self._update_saved_filters_combo()
+
+    def _rename_selected_filter_set(self):
+        current_name = self.main_window.saved_filters_combo.currentText()
+        if not current_name: return
+        
+        new_name, ok = QInputDialog.getText(self.main_window, "Zmiana nazwy", "Nowa nazwa:", QLineEdit.Normal, current_name)
+        if ok and new_name and new_name != current_name:
+             saved = self.main_window.user_app_settings.get('saved_filters', {})
+             if new_name in saved:
+                 QMessageBox.warning(self.main_window, "Błąd", "Nazwa zajęta.")
+                 return
+             
+             data = saved.pop(current_name)
+             saved[new_name] = data
+             self.main_window.user_app_settings['saved_filters'] = saved
+             self.main_window.settings_db.save_settings(self.main_window.user_app_settings)
+             self._update_saved_filters_combo()
+             self.main_window.saved_filters_combo.setCurrentText(new_name)
+
+    def show_filter_select_dialog(self):
+        """Dialog wyboru widocznych filtrów."""
+        current_visible_ids = self.main_window.visible_filters_list
+        available_filters = self.main_window.ALL_FILTERS.copy()
+        
+        # Synchronizacja custom widgets jeśli potrzeba (metoda w main)
+        if hasattr(self.main_window, '_synchronize_custom_filter_widgets'):
+            self.main_window._synchronize_custom_filter_widgets()
+            
+        for col_id, data in self.main_window.custom_columns.items():
+            available_filters.append((col_id, f"{data.get('name', col_id)} (Własna)", False))
+            
+        dialog = FilterSelectDialog(self.main_window, available_filters=available_filters, visible_filters=current_visible_ids)
+        if dialog.exec() == QDialog.Accepted:
+            new_list = dialog.get_visible_filters_ordered()
+            self.main_window.visible_filters_list = new_list
+            self.main_window.user_app_settings['visible_filters'] = new_list
+            self.main_window.settings_db.save_settings(self.main_window.user_app_settings)
+            
+            self._apply_filter_visibility_and_order()
+            self._apply_filter_visibility_and_order()
+
+    def _clear_all_filters(self):
+        """Resetuje wszystkie filtry do stanu początkowego."""
+        # 1. Resetuj Combo Boxy
+        # Iterujemy po znanych nazwach atrybutów combo boxów w main_window
+        filter_definitions = [
+            "grupa_main_filter_combo", "wydzial_combo", "default_location_combo",
+            "system_czasu_pracy_combo", "rola_combo", "podrola_combo",
+            "jezyk_combo", "etat_combo", "dtn_combo", "rka_combo",
+            "grafik_za_punkty_combo", "brak_nocki_combo"
+        ]
+        
+        for combo_name in filter_definitions:
+            if hasattr(self.main_window, combo_name):
+                combo = getattr(self.main_window, combo_name)
+                if isinstance(combo, CustomMultiComboBox):
+                    combo.clear_selection()
+
+        # 2. Resetuj pola tekstowe i listy
+        if hasattr(self.main_window, 'przelozony_filter'):
+            self.main_window.przelozony_filter.clear()
+        if hasattr(self.main_window, 'uzytkownik_filter'):
+            self.main_window.uzytkownik_filter.clear()
+            
+        # 3. Resetuj checkboxy obecności/nieobecności
+        if hasattr(self.main_window, 'filter_by_presence_check'):
+             self.main_window.filter_by_presence_check.setChecked(False)
+        if hasattr(self.main_window, 'filter_by_absence_check'):
+             self.main_window.filter_by_absence_check.setChecked(False)
+
+        # Odśwież dane
+        if hasattr(self.main_window, 'filter_data'):
+            self.main_window.filter_data()

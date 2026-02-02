@@ -1,0 +1,1063 @@
+# schedule_edit_dialogs.py
+# -*- coding: utf-8 -*-
+
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                               QPushButton, QComboBox, QGroupBox, QRadioButton,
+                               QFontComboBox, QSpinBox, QCheckBox, QWidget,
+                               QTabWidget, QGridLayout, QMessageBox, QLineEdit,
+                               QApplication, QSpacerItem, QSizePolicy,
+                               QTableWidget, QTableWidgetItem, QHeaderView, QDialogButtonBox, QTableView,
+                               QAbstractItemView, QInputDialog)  # Dodano QInputDialog
+from PySide6.QtCore import Qt, Signal, QTimer, QDate
+from PySide6.QtGui import QFont, QColor, QCursor
+
+from styles import AppStyles
+from debug_utils import debug_print, log_error
+from app_settings import app_settings
+from db_connector import get_modifier_id
+from symbol_parser import parse_symbol, build_symbol
+from schedule_change_model import ScheduleChangeModel
+from schedule_change_delegate import ScheduleChangeDelegate
+from schedule_change_processor import ChangeType
+from ui_utils import show_confirmation_dialog, show_warning_dialog
+from ui_components import DigitSelectionDialog
+
+
+class DateTableWidgetItem(QTableWidgetItem):
+    """Niestandardowy element tabeli do sortowania dat chronologicznie."""
+
+    def __init__(self, date_str):
+        super().__init__(QDate.fromString(date_str, "yyyy-MM-dd").toString("dd.MM.yyyy"))
+        self.date = QDate.fromString(date_str, "yyyy-MM-dd")
+
+    def __lt__(self, other):
+        return self.date < other.date
+
+
+class DayOfWeekItem(QTableWidgetItem):
+    """Niestandardowy element tabeli do sortowania dni tygodnia."""
+
+    def __init__(self, qdate_obj):
+        day_names = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Nd"]
+        super().__init__(day_names[qdate_obj.dayOfWeek() - 1])
+        self.day_of_week = qdate_obj.dayOfWeek()
+
+    def __lt__(self, other):
+        return self.day_of_week < other.day_of_week
+
+
+class ThemeSettingsDialog(QDialog):
+    settings_changed = Signal(str, str, int)
+
+    def __init__(self, parent=None, current_theme="dark", current_font="", current_font_size=9):
+        super().__init__(parent)
+        self.parent_widget = parent
+        self.setWindowTitle("Ustawienia motywu")
+        self.setMinimumWidth(300)
+        self.current_theme = current_theme
+        self.current_font = current_font
+        self.current_font_size = current_font_size
+        self.setup_ui()
+        self.apply_dialog_theme()
+        self.dark_theme_radio.toggled.connect(self.apply_immediate_changes)
+        self.font_combo.currentFontChanged.connect(self.apply_immediate_changes)
+        self.font_size_spin.valueChanged.connect(self.apply_immediate_changes)
+
+    def apply_dialog_theme(self):
+        theme_to_apply = self.current_theme
+        if self.parent_widget and hasattr(self.parent_widget, 'is_dark_theme'):
+            theme_to_apply = "dark" if self.parent_widget.is_dark_theme else "light"
+        if hasattr(self, 'dark_theme_radio') and self.dark_theme_radio.isChecked():
+            theme_to_apply = "dark"
+        elif hasattr(self, 'light_theme_radio') and self.light_theme_radio.isChecked():
+            theme_to_apply = "light"
+        self.setStyleSheet(AppStyles.get_dialog_style(theme_to_apply))
+        button_style = AppStyles.get_button_style(theme_to_apply)
+        if hasattr(self, 'ok_button'): self.ok_button.setStyleSheet(button_style)
+        if hasattr(self, 'cancel_button'): self.cancel_button.setStyleSheet(button_style)
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        theme_group = QGroupBox("Motyw")
+        theme_layout = QVBoxLayout()
+        self.dark_theme_radio = QRadioButton("Ciemny")
+        self.light_theme_radio = QRadioButton("Jasny")
+        if self.current_theme == "dark":
+            self.dark_theme_radio.setChecked(True)
+        else:
+            self.light_theme_radio.setChecked(True)
+        theme_layout.addWidget(self.dark_theme_radio)
+        theme_layout.addWidget(self.light_theme_radio)
+        theme_group.setLayout(theme_layout)
+        font_group = QGroupBox("Czcionka")
+        font_layout = QVBoxLayout()
+        font_type_layout = QHBoxLayout()
+        font_type_label = QLabel("Typ czcionki:")
+        self.font_combo = QFontComboBox()
+        if self.current_font: self.font_combo.setCurrentFont(QFont(self.current_font))
+        font_type_layout.addWidget(font_type_label)
+        font_type_layout.addWidget(self.font_combo)
+        font_size_layout = QHBoxLayout()
+        font_size_label = QLabel("Rozmiar czcionki:")
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(6, 24)
+        self.font_size_spin.setValue(self.current_font_size)
+        font_size_layout.addWidget(font_size_label)
+        font_size_layout.addWidget(self.font_size_spin)
+        font_layout.addLayout(font_type_layout)
+        font_layout.addLayout(font_size_layout)
+        font_group.setLayout(font_layout)
+        self.save_settings_checkbox = QCheckBox("Zapamiętaj ustawienia")
+        self.save_settings_checkbox.setChecked(True)
+        buttons_layout = QHBoxLayout()
+        self.ok_button = QPushButton("OK")
+        self.cancel_button = QPushButton("Anuluj")
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.ok_button)
+        buttons_layout.addWidget(self.cancel_button)
+        main_layout.addWidget(theme_group)
+        main_layout.addWidget(font_group)
+        main_layout.addWidget(self.save_settings_checkbox)
+        main_layout.addLayout(buttons_layout)
+
+    def apply_immediate_changes(self):
+        if not hasattr(self, 'font_combo'): return
+        selected_theme = "dark" if self.dark_theme_radio.isChecked() else "light"
+        font_family = self.font_combo.currentFont().family()
+        font_size = self.font_size_spin.value()
+        self.settings_changed.emit(selected_theme, font_family, font_size)
+        current_dialog_theme_choice = self.get_current_theme_choice()
+        self.setStyleSheet(AppStyles.get_dialog_style(current_dialog_theme_choice))
+        button_style = AppStyles.get_button_style(current_dialog_theme_choice)
+        if hasattr(self, 'ok_button'): self.ok_button.setStyleSheet(button_style)
+        if hasattr(self, 'cancel_button'): self.cancel_button.setStyleSheet(button_style)
+        self.update()
+
+    def get_current_theme_choice(self):
+        if hasattr(self, 'dark_theme_radio') and self.dark_theme_radio.isChecked():
+            return "dark"
+        elif hasattr(self, 'light_theme_radio') and self.light_theme_radio.isChecked():
+            return "light"
+        return self.current_theme
+
+
+class InsertSymbolDialog(QDialog):
+    symbol_selected = Signal(str)
+
+    def __init__(self, parent=None, selected_cells_data=None):
+        super().__init__(parent)
+        self.parent_widget = parent
+        self.selected_cells_data = selected_cells_data or []
+        self.setWindowTitle("Wstaw symbol")
+        self.setMinimumWidth(300);
+        self.setMinimumHeight(250)
+        self.selected_symbol = ""
+        self.user_role = getattr(self.parent_widget, 'current_user_app_role', "")
+        self.valid_symbols = set()
+        self.parent_font = QApplication.font()
+        if self.parent_widget: self.parent_font = self.parent_widget.font()
+        self.dtn_co_only_mode = False
+        if self.user_role in ['Lider', 'Lider OUT'] and selected_cells_data:
+            if all(cell.get('wydzial', '').strip().lower() == 'dtn' for cell in selected_cells_data):
+                self.dtn_co_only_mode = True
+        self.setup_ui()
+        self.apply_dialog_theme()
+
+    def apply_dialog_theme(self):
+        actual_theme = "dark"
+        if self.parent_widget and hasattr(self.parent_widget, 'is_dark_theme'):
+            actual_theme = "dark" if self.parent_widget.is_dark_theme else "light"
+        self.setStyleSheet(AppStyles.get_dialog_style(actual_theme))
+        button_style_qss = AppStyles.get_button_style(actual_theme)
+        line_edit_style_qss = AppStyles.get_line_edit_style(actual_theme)
+        tab_widget_style_qss = self._get_tab_widget_style(actual_theme)
+        if hasattr(self, 'symbol_input'): self.symbol_input.setStyleSheet(line_edit_style_qss)
+        if hasattr(self, 'tabs'):
+            self.tabs.setStyleSheet(tab_widget_style_qss)
+            for i in range(self.tabs.count()):
+                tab_content_widget = self.tabs.widget(i)
+                if tab_content_widget:
+                    buttons_in_tab = tab_content_widget.findChildren(QPushButton)
+                    for btn in buttons_in_tab:
+                        btn.setStyleSheet(button_style_qss)
+        if hasattr(self, 'cancel_button'): self.cancel_button.setStyleSheet(button_style_qss)
+        label_style_qss = AppStyles.get_label_style(actual_theme)
+        if hasattr(self, 'instruction_label'): self.instruction_label.setStyleSheet(label_style_qss)
+        if hasattr(self, 'input_label'): self.input_label.setStyleSheet(label_style_qss)
+        if hasattr(self, 'validation_label'): self.validation_label.setStyleSheet(label_style_qss)
+        self.style().unpolish(self);
+        self.style().polish(self);
+        self.update()
+
+    def _get_tab_widget_style(self, theme):
+        main_bg = AppStyles.DARK_BACKGROUND_MAIN if theme == "dark" else AppStyles.LIGHT_BACKGROUND_MAIN
+        control_bg = AppStyles.DARK_BACKGROUND_CONTROLS if theme == "dark" else AppStyles.LIGHT_BACKGROUND_CONTROLS
+        text_color = AppStyles.DARK_TEXT_PRIMARY if theme == "dark" else AppStyles.LIGHT_TEXT_PRIMARY
+        border_color = AppStyles.DARK_BORDER_SECONDARY if theme == "dark" else AppStyles.LIGHT_BORDER_PRIMARY
+        accent_color = AppStyles.ACCENT_COLOR_DARK if theme == "dark" else AppStyles.ACCENT_COLOR_LIGHT
+        tab_bar_bg = control_bg if theme == "dark" else AppStyles.LIGHT_BACKGROUND_HOVER
+        tab_pane_bg = control_bg
+        return f"""
+            QTabWidget::pane {{ border: 1px solid {border_color}; border-top: none; background-color: {tab_pane_bg}; border-bottom-left-radius: {AppStyles.BORDER_RADIUS}; border-bottom-right-radius: {AppStyles.BORDER_RADIUS}; }}
+            QTabBar::tab {{ background-color: {tab_bar_bg}; color: {text_color}; border: 1px solid {border_color}; border-bottom: none; padding: 5px 10px; margin-right: 1px; border-top-left-radius: {AppStyles.BORDER_RADIUS}; border-top-right-radius: {AppStyles.BORDER_RADIUS}; }}
+            QTabBar::tab:selected {{ background-color: {accent_color}; color: {'white' if theme == "dark" else AppStyles.LIGHT_BACKGROUND_CONTROLS}; }}
+            QTabBar::tab:!selected {{ background-color: {main_bg if theme == "dark" else AppStyles.LIGHT_BACKGROUND_MAIN}; }}
+            QTabBar::tab:hover:!selected {{ background-color: {AppStyles.DARK_BACKGROUND_HOVER if theme == "dark" else AppStyles.LIGHT_BACKGROUND_HOVER}; }}
+        """
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        self.instruction_label = QLabel("Wpisz symbol lub wybierz z poniższych zakładek")
+        self.instruction_label.setStyleSheet("color: gray; font-style: italic;")
+        self.instruction_label.setFont(self.parent_font)
+        main_layout.addWidget(self.instruction_label)
+        input_layout = QHBoxLayout()
+        self.input_label = QLabel("Symbol:")
+        self.input_label.setFont(self.parent_font)
+        self.symbol_input = QLineEdit()
+        self.symbol_input.setMaxLength(5)
+        font = QFont(self.parent_font)
+        font.setBold(True)
+        font.setPointSize(font.pointSize() + 2)
+        self.symbol_input.setFont(font)
+        self.symbol_input.textChanged.connect(self.on_symbol_input_changed)
+        self.symbol_input.returnPressed.connect(self.check_and_accept)
+        input_layout.addWidget(self.input_label)
+        input_layout.addWidget(self.symbol_input)
+        main_layout.addLayout(input_layout)
+        self.tabs = QTabWidget()
+        self.tabs.setFont(self.parent_font)
+        self.valid_symbols.clear()
+        symbol_categories = app_settings.SYMBOL_CATEGORIES
+        for category_name, symbols_dict in symbol_categories.items():
+            symbols_list = list(symbols_dict.items())
+            self.add_tab_with_symbols(symbols_list, category_name)
+            for symbol_key in symbols_dict.keys():
+                self.valid_symbols.add(symbol_key)
+        buttons_layout = QHBoxLayout()
+        self.cancel_button = QPushButton("Anuluj")
+        self.cancel_button.setFont(self.parent_font)
+        self.cancel_button.clicked.connect(self.reject)
+        self.validation_label = QLabel("")
+        self.validation_label.setFont(self.parent_font)
+        buttons_layout.addWidget(self.validation_label)
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.cancel_button)
+        main_layout.addWidget(self.tabs)
+        main_layout.addLayout(buttons_layout)
+        self.symbol_input.setFocus()
+
+    def add_tab_with_symbols(self, symbols, tab_name):
+        tab = QWidget()
+        tab_layout = QGridLayout(tab)
+        tab_layout.setSpacing(5)
+
+        # Sprawdzamy warunki dla Lidera i wybranych komórek
+        has_non_lider_selection = False
+        if self.user_role == 'Lider':
+            for cell in self.selected_cells_data:
+                if cell.get('rola_nazwa') != 'Lider':
+                    has_non_lider_selection = True
+                    break
+
+        for idx, (symbol, desc) in enumerate(symbols):
+            button = QPushButton(symbol)
+            button.setFont(self.parent_font)
+            button.setProperty("symbol", symbol)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.clicked.connect(self.on_symbol_button_clicked)
+
+            is_generally_allowed = app_settings.has_symbol_permission(self.user_role, symbol)
+
+            # --- NOWA LOGIKA BLOKOWANIA PRZYCISKÓW ---
+            is_disabled_by_logic = False
+            tooltip_suffix = ""
+
+            if is_generally_allowed and self.user_role == 'Lider':
+                # Jeśli Lider zaznaczył kogoś kto nie jest Liderem
+                if has_non_lider_selection:
+                    if symbol.upper() in ['U', 'OS']:
+                        is_disabled_by_logic = True
+                        tooltip_suffix = "\n(Dostępne tylko dla Liderów w Twoim wydziale)"
+
+            # Logika DTN (zachowana)
+            if self.dtn_co_only_mode:
+                if symbol.upper() == 'CO' and is_generally_allowed:
+                    pass  # OK
+                else:
+                    is_disabled_by_logic = True
+                    tooltip_suffix = "\n(Dla DTN dozwolone tylko CO)"
+
+            if is_generally_allowed and not is_disabled_by_logic:
+                button.setEnabled(True)
+                button.setToolTip(desc)
+            else:
+                button.setEnabled(False)
+                reason = tooltip_suffix if tooltip_suffix else "\n(Brak uprawnień dla Twojej roli)"
+                button.setToolTip(f"{desc}{reason}")
+
+            row = idx // 4
+            col = idx % 4
+            tab_layout.addWidget(button, row, col)
+
+        tab_layout.addItem(QSpacerItem(10, 10, QSizePolicy.Expanding, QSizePolicy.Expanding), (len(symbols) // 4) + 1,
+                           0, 1, 4)
+        self.tabs.addTab(tab, tab_name)
+
+    def on_symbol_button_clicked(self):
+        button = self.sender()
+        if button:
+            symbol = button.property("symbol")
+            if symbol: self.accept_symbol(symbol)
+
+    def on_symbol_input_changed(self, text):
+        uppercase_text = text.upper()
+        if text != uppercase_text:
+            self.symbol_input.blockSignals(True);
+            self.symbol_input.setText(uppercase_text);
+            self.symbol_input.blockSignals(False)
+        self.selected_symbol = uppercase_text.strip()
+        if self.selected_symbol:
+            if self.selected_symbol in self.valid_symbols:
+                self.validation_label.setText("Symbol prawidłowy");
+                self.validation_label.setStyleSheet("color: green;")
+            else:
+                self.validation_label.setText("Symbol niedostępny!");
+                self.validation_label.setStyleSheet("color: red;")
+        else:
+            self.validation_label.setText("")
+
+    def accept_symbol(self, symbol):
+        self.selected_symbol = symbol
+        self.symbol_input.blockSignals(True);
+        self.symbol_input.setText(symbol);
+        self.symbol_input.blockSignals(False)
+        self.validation_label.setText("Symbol prawidłowy");
+        self.validation_label.setStyleSheet("color: green;")
+        self.check_and_accept()
+
+    def check_and_accept(self):
+        if self.selected_symbol and self.selected_symbol in self.valid_symbols:
+            if app_settings.has_symbol_permission(self.user_role, self.selected_symbol):
+                super().accept()
+            else:
+                show_warning_dialog(self, "Brak uprawnień",
+                                    f"Twoja rola ('{self.user_role}') nie ma uprawnień do użycia symbolu '{self.selected_symbol}'.")
+        elif self.selected_symbol:
+            show_warning_dialog(self, "Nieprawidłowy symbol",
+                                f"Symbol '{self.selected_symbol}' nie jest poprawnym symbolem.")
+        else:
+            show_warning_dialog(self, "Brak symbolu", "Proszę wpisać lub wybrać symbol.")
+            self.selected_symbol = "";
+            self.symbol_input.setText("");
+            self.symbol_input.setFocus()
+
+    def get_selected_symbol(self):
+        return self.selected_symbol
+
+
+# (Klasa ReasonDialog pozostaje bez zmian)
+class ReasonDialog(QDialog):
+    """Prosty dialog do wpisania i pobrania powodu zmiany."""
+
+    def __init__(self, parent=None, user_name: str = "", default_reason: str = "Na prośbę doradcy"):
+        super().__init__(parent)
+        # --- POPRAWKA: Pobierz motyw z rodzica (ScheduleChangeDialog) ---
+        self.is_dark_theme = (parent.determined_theme == 'dark') if hasattr(parent, 'determined_theme') else False
+        self.setWindowTitle("Powód zmiany lokalizacji")
+        self.setMinimumWidth(350)
+        layout = QVBoxLayout(self)
+        if user_name:
+            user_label = QLabel(f"<b>Pracownik:</b> {user_name}")
+            layout.addWidget(user_label)
+        layout.addWidget(QLabel("Proszę podać powód zmiany lokalizacji:"))
+        self.reason_input = QLineEdit(default_reason)
+        layout.addWidget(self.reason_input)
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+        self.apply_styles()
+        self.reason_input.selectAll()
+        self.reason_input.setFocus()
+
+    def getReason(self):
+        return self.reason_input.text()
+
+    def apply_styles(self):
+        theme = "dark" if self.is_dark_theme else "light"
+        self.setStyleSheet(AppStyles.get_dialog_style(theme))
+        for button in self.button_box.buttons():
+            button.setStyleSheet(AppStyles.get_button_style(theme))
+        self.reason_input.setStyleSheet(AppStyles.get_line_edit_style(theme))
+        # --- POPRAWKA: Ustaw polskie przyciski ---
+        self.button_box.button(QDialogButtonBox.Ok).setText("OK")
+        self.button_box.button(QDialogButtonBox.Cancel).setText("Anuluj")
+        # --- KONIEC POPRAWKI ---
+
+
+# --- POCZĄTEK ZMIAN: Uproszczona klasa ScheduleChangeDialog ---
+
+class ScheduleChangeDialog(QDialog):
+    """
+    Dialog do wstawiania zmian w grafiku.
+    WERSJA UPROSZCZONA: Przekazuje surowe dane do wątku w tle.
+    """
+    # Sygnał emituje obiekt (krotkę), a nie listę
+    changes_requested = Signal(object)
+
+    def __init__(self, parent=None, grouped_cells=None, year=None, month=None, main_window=None):
+        super().__init__(parent)
+        self.parent_widget = parent
+        self.main_window = main_window
+        self.determined_theme = "dark" if getattr(parent, 'is_dark_theme', False) else "light"
+        self.setWindowTitle("Wstaw zmianę grafiku")
+        self.setMinimumWidth(1100);
+        self.setMinimumHeight(600)
+        self.year, self.month = year, month
+        self.user_role = getattr(self.parent_widget, 'current_user_role', "Użytkownik")
+
+        # Ta pamięć podręczna będzie teraz zawierać JEDEN globalny powód
+        self.global_reason_for_change = None
+
+        self.flattened_cells = self._prepare_initial_data(grouped_cells)
+        self.setup_ui()
+        self.apply_dialog_theme()
+        debug_print(f"[DialogZmian] Utworzono. Załadowano {len(self.flattened_cells)} wierszy.")
+
+    def _prepare_initial_data(self, grouped_cells):
+        """
+        Przygotowuje spłaszczoną listę danych (BEZ zapytań do bazy).
+        """
+        debug_print("[DialogZmian] Rozpoczynam _prepare_initial_data (bez zapytań DB)...")
+        flattened = []
+        if not grouped_cells: return flattened
+        day_names_map = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Nd"]
+
+        for user_id, dates in grouped_cells.items():
+            for date_str, cells in dates.items():
+                for cell in cells:
+                    new_cell = cell.copy()
+                    symbol = new_cell.get('symbol', '')
+                    parsed_symbol = parse_symbol(symbol)
+                    q_date = QDate.fromString(date_str, "yyyy-MM-dd")
+
+                    new_cell['date_str_display'] = q_date.toString("dd.MM.yyyy")
+                    new_cell['day_of_week_str'] = day_names_map[q_date.dayOfWeek() - 1]
+
+                    start_hour = parsed_symbol.get('start_hour')
+                    work_hours = parsed_symbol.get('work_hours')
+                    special = parsed_symbol.get('special_symbol')
+
+                    new_cell['current_start_hour'] = start_hour
+                    new_cell['current_work_hours'] = work_hours
+
+                    loc = None
+                    is_work_shift = start_hour is not None
+                    is_work_like_absence = special and special.upper() in app_settings.WORK_LIKE_SYMBOLS
+
+                    if is_work_shift or is_work_like_absence:
+                        # Po prostu weź lokalizację z symbolu lub domyślną.
+                        loc = parsed_symbol.get('location') or new_cell.get('lokalizacja_domyslna')
+
+                    new_cell['current_location'] = loc
+
+                    new_cell['status'] = ''
+                    new_cell['status_message'] = ''
+                    new_cell['is_dirty'] = False
+                    flattened.append(new_cell)
+
+        debug_print(f"[DialogZmian] Zakończono _prepare_initial_data. Przygotowano {len(flattened)} komórek.")
+        return flattened
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        apply_all_group = self._create_apply_all_group()
+        main_layout.addWidget(apply_all_group)
+        self.cells_table = QTableView(self)
+        self.cells_table.setSortingEnabled(True)
+        self.cells_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.cells_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.cells_table.horizontalHeader().setStretchLastSection(True)
+        self.cells_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.model = ScheduleChangeModel(self.flattened_cells, self)
+        self.delegate = ScheduleChangeDelegate(self)
+        self.cells_table.setModel(self.model)
+        self.cells_table.setItemDelegate(self.delegate)
+        self.delegate.apply_clicked.connect(self.apply_change_by_index)
+        main_layout.addWidget(self.cells_table)
+        button_layout = QHBoxLayout()
+        self.close_button = QPushButton("Zamknij")
+        self.close_button.clicked.connect(self.close)
+        self.apply_all_rows_button = QPushButton("Zatwierdź wszystkie zmiany")
+        self.apply_all_rows_button.clicked.connect(self._apply_all_pending_changes)
+        button_layout.addStretch()
+        button_layout.addWidget(self.apply_all_rows_button)
+        button_layout.addWidget(self.close_button)
+        main_layout.addLayout(button_layout)
+        self.cells_table.sortByColumn(0, Qt.AscendingOrder)
+
+    def apply_dialog_theme(self):
+        theme = self.determined_theme
+        self.setStyleSheet(AppStyles.get_dialog_style(theme))
+        button_style = AppStyles.get_button_style(theme)
+        combobox_style = AppStyles.get_combobox_style(theme)
+        checkbox_style = AppStyles.get_checkbox_style(theme)
+        self.all_time_button.setStyleSheet(button_style)
+        self.all_hours_button.setStyleSheet(button_style)
+        self.all_location_combo.setStyleSheet(combobox_style)
+        self.apply_location_check.setStyleSheet(checkbox_style)
+        self.apply_time_check.setStyleSheet(checkbox_style)
+        self.apply_hours_check.setStyleSheet(checkbox_style)
+        self.apply_all_button.setStyleSheet(button_style)
+        self.apply_all_rows_button.setStyleSheet(button_style)
+        self.close_button.setStyleSheet(button_style)
+        self.cells_table.setStyleSheet(AppStyles.get_table_style(theme))
+
+    def _create_apply_all_group(self):
+        group = QGroupBox("Zastosuj dla wszystkich (z uwzględnieniem uprawnień)")
+        layout = QHBoxLayout(group)
+        self.apply_location_check = QCheckBox("Lokalizacja:")
+        layout.addWidget(self.apply_location_check)
+        self.all_location_combo = QComboBox()
+        self.all_location_combo.addItem("SBC (s)", "s")
+        self.all_location_combo.addItem("mPrzystanek (p)", "p")
+        self.all_location_combo.addItem("HomeOffice (h)", "h")
+        layout.addWidget(self.all_location_combo)
+        layout.addSpacing(15)
+        self.apply_time_check = QCheckBox("Godzina rozp.:")
+        layout.addWidget(self.apply_time_check)
+        self.all_time_button = QPushButton("Wybierz")
+        self.all_time_button.setProperty("field_type", "hour")
+        layout.addWidget(self.all_time_button)
+        layout.addSpacing(15)
+        self.apply_hours_check = QCheckBox("Liczba godzin:")
+        layout.addWidget(self.apply_hours_check)
+        self.all_hours_button = QPushButton("Wybierz")
+        self.all_hours_button.setProperty("field_type", "hours")
+        layout.addWidget(self.all_hours_button)
+        layout.addStretch()
+        self.apply_all_button = QPushButton("Wstaw dla wszystkich")
+        layout.addWidget(self.apply_all_button)
+        self.apply_location_check.toggled.connect(self._update_apply_all_button_state)
+        self.apply_time_check.toggled.connect(self._update_apply_all_button_state)
+        self.apply_hours_check.toggled.connect(self._update_apply_all_button_state)
+        self.all_time_button.clicked.connect(self.show_digit_selection)
+        self.all_hours_button.clicked.connect(self.show_digit_selection)
+        self.apply_all_button.clicked.connect(self._apply_all_changes)
+        self._update_apply_all_button_state()
+        return group
+
+    def _update_apply_all_button_state(self):
+        is_any_checked = (
+                self.apply_location_check.isChecked() or
+                self.apply_time_check.isChecked() or
+                self.apply_hours_check.isChecked()
+        )
+        self.apply_all_button.setEnabled(is_any_checked)
+
+    def show_digit_selection(self):
+        target_button = self.sender()
+        if not target_button: return
+        field_type = target_button.property("field_type")
+        is_hour = (field_type == "hour")
+        values = list(range(24)) if is_hour else list(range(1, 14))
+        title = "Wybierz godzinę rozp." if is_hour else "Wybierz liczbę godzin"
+
+        dialog = DigitSelectionDialog(parent=self, title=title, values=values, current_theme=self.determined_theme)
+
+        # --- ZMIANA: Otwieraj pod kursorem myszki zamiast na środku głównego ekranu ---
+        # Było: dialog.move(QApplication.primaryScreen().geometry().center() - dialog.rect().center())
+        dialog.move(QCursor.pos())
+        # ------------------------------------------------------------------------------
+
+        if dialog.exec():
+            selected_value = dialog.get_selected_value()
+            target_button.setText(str(selected_value) if selected_value is not None else "Wybierz")
+
+    def _update_row_data_from_global_settings(self, visual_row: int):
+        """
+        Aktualizuje dane w modelu dla danego wiersza na podstawie globalnych ustawień.
+        NOWA LOGIKA: Pomija wiersze, które są absencjami lub są niekompletne
+        i nie zostałyby uzupełnione przez tę operację.
+        """
+        row_data = self.model.get_row_data(visual_row)
+        if not row_data: return
+        permissions = self.main_window._get_permission_for_cell(row_data)
+
+        parsed = parse_symbol(row_data.get('symbol', ''))
+        special = parsed.get('special_symbol')
+
+        # Warunek 1: Czy to jest absencja? (CO, UZ, NN itp.)
+        is_absence = special and special.upper() not in app_settings.WORK_LIKE_SYMBOLS
+        if is_absence:
+            return  # Zawsze pomijaj absencje przy masowej edycji godzin/lokalizacji
+
+        # To jest zmiana robocza (lub pusta)
+        original_start = parsed.get('start_hour')
+        original_hours = parsed.get('work_hours')
+
+        # --- NOWA LOGIKA: Sprawdź, czy można zastosować zmianę ---
+
+        # Czy globalne checkboxy są zaznaczone?
+        change_loc = self.apply_location_check.isChecked()
+        change_time = self.apply_time_check.isChecked()
+        change_hours = self.apply_hours_check.isChecked()
+
+        global_loc = self.all_location_combo.currentData()
+        global_time_str = self.all_time_button.text()
+        global_hours_str = self.all_hours_button.text()
+
+        # --- KLUCZOWA WALIDACJA (Problem 1) ---
+        # Jeśli wiersz nie miał godziny rozpoczęcia I jej nie dodajemy -> Pomiń
+        if original_start is None and not change_time:
+            debug_print(f"[DialogZmian] Pomijam wiersz {visual_row}: brak 'Godzina rozp.'")
+            return  # Pomiń, bo wiersz jest niekompletny
+
+        # Jeśli wiersz nie miał liczby godzin I jej nie dodajemy -> Pomiń
+        if original_hours is None and not change_hours:
+            debug_print(f"[DialogZmian] Pomijam wiersz {visual_row}: brak 'Liczba godzin'")
+            return  # Pomiń, bo wiersz jest niekompletny
+
+        # --- KONIEC KLUCZOWEJ WALIDACJI ---
+
+        # Jeśli doszliśmy tutaj, wiersz jest kompletny lub zostanie uzupełniony.
+        # Zastosuj zmiany (jeśli są dozwolone).
+
+        if change_loc and permissions['can_edit_location']:
+            self.model.setData(self.model.index(visual_row, self.model.COL_LOCATION), global_loc, Qt.EditRole)
+
+        if change_time and permissions['can_edit_hours']:
+            if global_time_str.isdigit():
+                self.model.setData(self.model.index(visual_row, self.model.COL_START_HOUR), int(global_time_str),
+                                   Qt.EditRole)
+
+        if change_hours and permissions['can_edit_hours']:
+            if global_hours_str.isdigit():
+                self.model.setData(self.model.index(visual_row, self.model.COL_WORK_HOURS), int(global_hours_str),
+                                   Qt.EditRole)
+
+    def _ask_for_global_reason_if_needed(self, rows_to_check: list) -> bool:
+        """
+        Skanuje listę danych. Jeśli znajdzie zmianę lokalizacji na niedomyślną,
+        pyta o powód JEDEN RAZ i zapisuje go w self.global_reason_for_change.
+        Zwraca False, jeśli użytkownik anulował, True w przeciwnym razie.
+        """
+        self.global_reason_for_change = None
+        needs_reason = False
+
+        debug_print(f"[DialogZmian] _ask_for_global_reason: Skanuję {len(rows_to_check)} wierszy...")
+
+        for row_data in rows_to_check:
+            # Sprawdź tylko wiersze oznaczone jako zmienione
+            if not row_data.get('is_dirty', False):
+                continue
+
+            parsed_old = parse_symbol(row_data.get('symbol', ''))
+
+            # --- KLUCZOWA POPRAWKA (Problem 2): Ustal 'starą' lokalizację ---
+            # 'stara' lokalizacja to ta, która jest FAKTYCZNIE w symbolu (może być None)
+            old_loc = parsed_old.get('location')
+            # --- KONIEC POPRAWKI ---
+
+            # 'nowa' lokalizacja to ta, którą ustawił użytkownik w tabeli
+            new_loc = row_data.get('current_location')
+
+            # Jeśli lokalizacja się nie zmieniła, ten wiersz nie wymaga powodu
+            if new_loc == old_loc:
+                continue
+
+                # Lokalizacja się zmieniła. Sprawdź, czy to zmiana robocza.
+            new_special = parsed_old.get('special_symbol')  # Symbol specjalny się nie zmienia
+            accepts_loc = (new_special is None or new_special.upper() in app_settings.WORK_LIKE_SYMBOLS)
+
+            if not accepts_loc:
+                continue  # To absencja, lokalizacja nie ma znaczenia
+
+            # To jest zmiana robocza I lokalizacja się zmieniła.
+            # Sprawdź, czy nowa lokalizacja jest niedomyślna.
+            default_loc = row_data.get('lokalizacja_domyslna')
+
+            if new_loc != default_loc:
+                needs_reason = True
+                debug_print(
+                    f"[DialogZmian] Wykryto zmianę na niedomyślną lokalizację dla: {row_data.get('uzytkownik_dane')}. Pytam o powód.")
+                break  # Wystarczy, że jeden wiersz potrzebuje powodu
+
+        if needs_reason:
+            dialog = QInputDialog(self)
+            dialog.setWindowTitle("Powód zmiany lokalizacji")
+            dialog.setLabelText(
+                "Wykryto zmianę lokalizacji na inną niż domyślna.\nProszę podać globalny powód dla wszystkich tych zmian:")
+            dialog.setTextValue("Na prośbę doradcy")
+            dialog.setOkButtonText("OK")
+            dialog.setCancelButtonText("Anuluj")
+
+            actual_theme = "dark" if self.determined_theme == "dark" else "light"
+            dialog.setStyleSheet(AppStyles.get_dialog_style(actual_theme))
+            dialog.findChild(QLineEdit).setStyleSheet(AppStyles.get_line_edit_style(actual_theme))
+            for btn in dialog.findChildren(QPushButton):
+                btn.setStyleSheet(AppStyles.get_button_style(actual_theme))
+
+            if dialog.exec() == QDialog.Accepted:
+                self.global_reason_for_change = dialog.textValue()
+                if not self.global_reason_for_change:  # Zabezpieczenie przed pustym powodem
+                    self.global_reason_for_change = "Brak powodu"
+                return True  # Użytkownik podał powód
+            else:
+                debug_print("[DialogZmian] Użytkownik anulował podawanie powodu.")
+                return False  # Użytkownik anulował
+
+        return True  # Powód nie był potrzebny
+
+    def apply_change_by_index(self, visual_row: int):
+        """Stosuje zmianę dla pojedynczego, klikniętego wiersza (NOWA LOGIKA)."""
+        debug_print(f"[DialogZmian] Akcja: apply_change_by_index (wiersz: {visual_row})")
+        row_data = self.model.get_row_data(visual_row)
+        if not row_data:
+            debug_print(f"[DialogZmian] Błąd: Nie znaleziono danych dla wiersza {visual_row}.")
+            return
+
+        # Oznacz ten wiersz jako 'brudny' do przetworzenia
+        row_data['is_dirty'] = True
+
+        # --- KLUCZOWA POPRAWKA (Problem 1) ---
+        # Sprawdź, czy ta zmiana jest w ogóle poprawna (czy ma godziny)
+        # zanim zapytasz o powód.
+        parsed = parse_symbol(row_data.get('symbol', ''))
+        special = parsed.get('special_symbol')
+        is_work_shift = not special or special.upper() in app_settings.WORK_LIKE_SYMBOLS
+
+        new_start = row_data.get('current_start_hour')
+        new_hours = row_data.get('current_work_hours')
+
+        if is_work_shift and (new_start is None or new_hours is None):
+            debug_print(f"[DialogZmian] Wiersz {visual_row}: Pusty (brak godz/liczby). Oznaczam jako 'Brak zmiany'.")
+            self.model.update_status(visual_row, 'no_change')
+            row_data['is_dirty'] = False  # Usuń oznaczenie
+            return
+        # --- KONIEC POPRAWKI ---
+
+        # Zapytaj o powód tylko dla tej jednej zmiany, jeśli jest potrzebny
+        if not self._ask_for_global_reason_if_needed([row_data]):
+            row_data['is_dirty'] = False  # Cofnij oznaczenie, jeśli anulowano
+            return  # Anulowano
+
+        # Ustaw status "W kolejce..." tylko dla tego jednego wiersza
+        self.model.update_status(visual_row, 'pending')
+
+        data_to_send = {visual_row: row_data}
+
+        self.changes_requested.emit((data_to_send, self.global_reason_for_change))
+        debug_print(f"[DialogZmian] Wysłano 1 wiersz (indeks {visual_row}) do przetworzenia.")
+
+    def _apply_all_changes(self):
+        """
+        Stosuje globalne ustawienia do wszystkich wierszy i zatwierdza je.
+        """
+        debug_print("[DialogZmian] Akcja: _apply_all_changes (Wstaw dla wszystkich)")
+        if not any([self.apply_location_check.isChecked(), self.apply_time_check.isChecked(),
+                    self.apply_hours_check.isChecked()]):
+            QMessageBox.warning(self, "Brak wyboru", "Proszę zaznaczyć, które atrybuty chcesz zastosować.");
+            return
+        reply = show_confirmation_dialog(self, "Potwierdzenie",
+                                         "Czy na pewno chcesz zastosować zmiany dla wszystkich wierszy?",
+                                         default_button=QMessageBox.No)
+        if reply == QMessageBox.No:
+            debug_print("[DialogZmian] Operacja anulowana przez użytkownika (potwierdzenie).")
+            return
+
+        # Krok 0: Zastosuj globalne zmiany do modelu
+        debug_print("[DialogZmian] Krok 0: Stosowanie ustawień globalnych do modelu...")
+        for row in range(self.model.rowCount()):
+            self._update_row_data_from_global_settings(row)
+        debug_print("[DialogZmian] Krok 0: Zakończono.")
+
+        # Krok 1: Zbierz dane (tylko 'brudne') i zapytaj o powód
+        debug_print("[DialogZmian] Krok 1: Skanowanie wierszy i zbieranie powodu...")
+
+        data_to_send = {}
+        dirty_rows_data = []
+
+        for row in range(self.model.rowCount()):
+            row_data = self.model.get_row_data(row)
+            if row_data.get('is_dirty', False):
+                data_to_send[row] = row_data
+                dirty_rows_data.append(row_data)
+
+        debug_print(f"[DialogZmian] Krok 1: Znaleziono {len(data_to_send)} 'brudnych' wierszy do wysłania.")
+
+        if not data_to_send:
+            QMessageBox.information(self, "Informacja", "Nie wykryto żadnych zmian do zatwierdzenia.")
+            return
+
+        if not self._ask_for_global_reason_if_needed(dirty_rows_data):
+            return  # Użytkownik anulował
+
+        # Krok 2: Ustaw status "Pending" i wyślij
+        debug_print("[DialogZmian] Krok 2: Ustawianie statusu 'Pending' i wysyłanie...")
+        for visual_row in data_to_send.keys():
+            self.model.update_status(visual_row, 'pending')
+
+        self.changes_requested.emit((data_to_send, self.global_reason_for_change))
+        debug_print(f"[DialogZmian] Krok 2: Sygnał 'changes_requested' wyemitowany dla {len(data_to_send)} wierszy.")
+
+    def _apply_all_pending_changes(self):
+        """
+        Zatwierdza wszystkie 'brudne' zmiany (ręcznie wprowadzone).
+        """
+        debug_print("[DialogZmian] Akcja: _apply_all_pending_changes (Zatwierdź wszystkie zmiany)")
+        reply = show_confirmation_dialog(self, "Potwierdzenie",
+                                         "Czy na pewno chcesz zatwierdzić wszystkie wprowadzone zmiany?",
+                                         default_button=QMessageBox.Yes)
+        if reply == QMessageBox.No:
+            debug_print("[DialogZmian] Operacja anulowana przez użytkownika (potwierdzenie).")
+            return
+
+        # Krok 1: Zbierz dane (tylko 'brudne') i zapytaj o powód
+        debug_print("[DialogZmian] Krok 1: Skanowanie wierszy i zbieranie powodu...")
+
+        data_to_send = {}
+        dirty_rows_data = []
+
+        for row in range(self.model.rowCount()):
+            row_data = self.model.get_row_data(row)
+            if row_data.get('is_dirty', False):
+                data_to_send[row] = row_data
+                dirty_rows_data.append(row_data)
+
+        debug_print(f"[DialogZmian] Krok 1: Znaleziono {len(data_to_send)} 'brudnych' wierszy do wysłania.")
+
+        if not data_to_send:
+            QMessageBox.information(self, "Informacja", "Nie wykryto żadnych zmian do zatwierdzenia.")
+            return
+
+        if not self._ask_for_global_reason_if_needed(dirty_rows_data):
+            return  # Użytkownik anulował
+
+        # Krok 2: Ustaw status "Pending" i wyślij
+        debug_print("[DialogZmian] Krok 2: Ustawianie statusu 'Pending' i wysyłanie...")
+        for visual_row in data_to_send.keys():
+            self.model.update_status(visual_row, 'pending')
+
+        self.changes_requested.emit((data_to_send, self.global_reason_for_change))
+        debug_print(f"[DialogZmian] Krok 2: Sygnał 'changes_requested' wyemitowany dla {len(data_to_send)} wierszy.")
+
+    def update_status_for_row(self, visual_row: int, status: str, result: dict = None):
+        """Aktualizuje status pojedynczego wiersza w modelu (wywoływane przez callback)."""
+        message = result.get('message', '') if result else ''
+        debug_print(f"[DialogZmian-Callback] Aktualizuję wiersz {visual_row} na status: {status} (Msg: {message})")
+
+        # --- POPRAWKA: Zabezpiecz przed błędem indeksu ---
+        if visual_row < 0 or visual_row >= self.model.rowCount():
+            log_error(f"[DialogZmian-Callback] Otrzymano nieprawidłowy indeks wiersza: {visual_row}. Wynik: {result}")
+            return
+        # --- KONIEC POPRAWKI ---
+
+        self.model.update_status(visual_row, status, message)
+
+        if status == 'success':
+            # Usuń podświetlenie 'dirty'
+            self.model.get_row_data(visual_row)['is_dirty'] = False
+            # Odśwież dane w wierszu, aby pokazać finalny symbol
+            self.refresh_row_data(visual_row)
+        elif status == 'no_change':
+            # Usuń podświetlenie 'dirty'
+            self.model.get_row_data(visual_row)['is_dirty'] = False
+            # Odśwież tylko tę komórkę (aby usunąć "W kolejce...")
+            status_index = self.model.index(visual_row, self.model.COL_STATUS)
+            self.model.dataChanged.emit(status_index, status_index, [Qt.DisplayRole])
+
+    def refresh_row_data(self, visual_row: int):
+        """
+        Pobiera świeże dane z okna głównego i aktualizuje wiersz w modelu,
+        zachowując istniejący stan statusu.
+        """
+        try:
+            target_row_data = self.model.get_row_data(visual_row)
+            if not target_row_data: return
+
+            user_id = target_row_data.get('uzytkownik_id')
+            date_str = target_row_data.get('date_str')
+            debug_print(f"[DialogZmian] refresh_row_data: Odświeżam wiersz {visual_row} ({user_id}, {date_str})")
+
+            # Pobierz najświeższe dane z modelu głównego (który jest już zaktualizowany)
+            fresh_cell_data = self.main_window.get_data_from_model_by_id(user_id, date_str)
+            if not fresh_cell_data:
+                log_error(f"[DialogZmian] Nie udało się pobrać świeżych danych dla wiersza {visual_row}.")
+                return
+
+            # Zaktualizuj słownik danych w modelu dialogu
+            target_row_data.update(fresh_cell_data)
+
+            # Przetwórz nowe dane, aby zaktualizować pola 'current'
+            symbol = target_row_data.get('symbol', '')  # To jest już NOWY symbol
+            parsed_symbol = parse_symbol(symbol)
+            debug_print(f"[DialogZmian] refresh_row_data: Nowy symbol to: {symbol}")
+
+            # Pobierz nowe wartości z parsowania
+            new_start = parsed_symbol.get('start_hour')
+            new_hours = parsed_symbol.get('work_hours')
+            new_loc = parsed_symbol.get('location') or target_row_data.get('lokalizacja_domyslna')
+
+            # Zaktualizuj pola 'current', których używa delegat do rysowania
+            target_row_data['current_start_hour'] = new_start
+            target_row_data['current_work_hours'] = new_hours
+            target_row_data['current_location'] = new_loc
+
+            # Poinformuj widok o zmianie całego wiersza (wszystkich kolumn)
+            start_index = self.model.index(visual_row, 0)
+            end_index = self.model.index(visual_row, self.model.columnCount() - 1)
+            self.model.dataChanged.emit(start_index, end_index, [Qt.DisplayRole])
+            debug_print(f"[DialogZmian] refresh_row_data: Emitowano dataChanged dla wiersza {visual_row}.")
+
+        except Exception as e:
+            log_error(f"Błąd w refresh_row_data: {e}", exception=e)
+
+
+# (Klasa DigitSelectionDialog pozostaje bez zmian)
+class DigitSelectionDialog(QDialog):
+    def __init__(self, parent=None, title="Wybierz wartość", values=None, current_theme="dark"):
+        super().__init__(parent)
+        self.current_theme = current_theme
+        self.setWindowTitle(title)
+        self.setModal(True);
+        self.selected_value = None
+        if values is None: values = list(range(10))
+        self.values = values
+        self.setObjectName("DigitSelectionDialogInstance")
+        self.setup_ui()
+
+    def apply_dialog_theme(self):
+        actual_theme = self.current_theme
+        self.setStyleSheet(AppStyles.get_dialog_style(actual_theme))
+        button_style_qss = AppStyles.get_button_style(actual_theme)
+        if hasattr(self, 'grid_layout'):
+            for i in range(self.grid_layout.count()):
+                widget = self.grid_layout.itemAt(i).widget()
+                if isinstance(widget, QPushButton): widget.setStyleSheet(button_style_qss); widget.style().unpolish(
+                    widget); widget.style().polish(widget)
+        if hasattr(self, 'cancel_button'):
+            self.cancel_button.setStyleSheet(button_style_qss);
+            self.cancel_button.style().unpolish(self.cancel_button);
+            self.cancel_button.style().polish(self.cancel_button)
+        # --- POPRAWKA: Styl dla clear_button ---
+        if hasattr(self, 'clear_button'):
+            self.clear_button.setStyleSheet(button_style_qss);
+            self.clear_button.style().unpolish(self.clear_button);
+            self.clear_button.style().polish(self.clear_button)
+        # --- KONIEC POPRAWKI ---
+        self.style().unpolish(self);
+        self.style().polish(self);
+        self.update()
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self);
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        self.grid_layout = QGridLayout();
+        self.grid_layout.setSpacing(5)
+        cols = min(6, len(self.values));
+        if cols == 0: cols = 1
+        for i, value in enumerate(self.values):
+            row, col = i // cols, i % cols
+            button = QPushButton(str(value));
+            button.setMinimumSize(25, 25)
+            button.setProperty("value", value);
+            button.clicked.connect(self.on_value_selected)
+            self.grid_layout.addWidget(button, row, col)
+        main_layout.addLayout(self.grid_layout)
+        self.clear_button = QPushButton("Wyczyść")
+        self.clear_button.clicked.connect(self.on_clear_selected)
+        self.cancel_button = QPushButton("Anuluj")
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.clear_button)
+        button_layout.addWidget(self.cancel_button)
+        main_layout.addLayout(button_layout);
+        self.adjustSize()
+        self.apply_dialog_theme()
+
+    def on_value_selected(self):
+        button = self.sender()
+        if button: self.selected_value = button.property("value"); self.accept()
+
+    def on_clear_selected(self):
+        self.selected_value = None;
+        self.accept()
+
+    def get_selected_value(self):
+        return self.selected_value
+
+
+# (Klasa OvertimeLocationDialog pozostaje bez zmian)
+class OvertimeLocationDialog(QDialog):
+    def __init__(self, parent, overtime_events, current_shift_location, current_theme="dark"):
+        super().__init__(parent)
+        self.setWindowTitle("Zmiana lokalizacji a nadgodziny");
+        self.setMinimumWidth(450)
+        self.theme = current_theme;
+        self.events = overtime_events
+        self.location_combos = []
+        self.setup_ui(current_shift_location);
+        self.apply_styles()
+
+    def setup_ui(self, current_shift_location):
+        layout = QVBoxLayout(self)
+        info_text = (f"Wykryto {len(self.events)} wpis(y) nadgodzin w tym dniu. "
+                     f"Lokalizacja w grafiku została zmieniona na <b>'{current_shift_location.upper()}'</b>.<br><br>"
+                     "Dla każdego wpisu nadgodzin możesz ustawić inną lokalizację.")
+        layout.addWidget(QLabel(info_text))
+        grid_layout = QGridLayout();
+        grid_layout.setSpacing(10)
+        grid_layout.addWidget(QLabel("<b>Godziny nadliczbowe</b>"), 0, 0)
+        grid_layout.addWidget(QLabel("<b>Obecna lokalizacja</b>"), 0, 1)
+        grid_layout.addWidget(QLabel("<b>Nowa lokalizacja</b>"), 0, 2)
+        for i, event in enumerate(self.events):
+            row = i + 1
+            event_label = QLabel(f"{event.get('time_from', '?')} - {event.get('time_to', '?')}")
+            current_ot_location_code = event.get('location', 'b/d')
+            location_map = {'h': 'Home Office', 's': 'SBC', 'p': 'Przystanek'}
+            current_ot_location_label = QLabel(location_map.get(current_ot_location_code, "Nieznana"))
+            location_combo = QComboBox()
+            location_combo.addItem("Bez zmian", "skip")
+            location_combo.addItem(f"Jak w grafiku ({current_shift_location.upper()})", current_shift_location)
+            location_combo.addItem("Home Office (h)", "h");
+            location_combo.addItem("SBC (s)", "s");
+            location_combo.addItem("Przystanek (p)", "p")
+            location_combo.setCurrentIndex(0)
+            self.location_combos.append(location_combo)
+            grid_layout.addWidget(event_label, row, 0);
+            grid_layout.addWidget(current_ot_location_label, row, 1);
+            grid_layout.addWidget(location_combo, row, 2)
+        layout.addLayout(grid_layout)
+        button_box = QHBoxLayout()
+        self.ok_button = QPushButton("Zatwierdź zmiany");
+        self.cancel_button = QPushButton("Anuluj")
+        self.ok_button.clicked.connect(self.accept);
+        self.cancel_button.clicked.connect(self.reject)
+        button_box.addStretch();
+        button_box.addWidget(self.cancel_button);
+        button_box.addWidget(self.ok_button)
+        layout.addLayout(button_box)
+
+    def apply_styles(self):
+        self.setStyleSheet(AppStyles.get_dialog_style(self.theme))
+        for button in self.findChildren(QPushButton): button.setStyleSheet(AppStyles.get_button_style(self.theme))
+        for combo in self.findChildren(QComboBox): combo.setStyleSheet(AppStyles.get_combobox_style(self.theme))
+        for box in self.findChildren(QGroupBox):
+            box.setStyleSheet(f"""
+                QGroupBox {{ border: 1px solid {'#495057' if self.theme == 'dark' else '#ced4da'}; border-radius: 4px; margin-top: 10px; }}
+                QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; padding: 0 3px; left: 10px; }}
+            """)
+
+    def get_selected_locations(self):
+        changes = []
+        for i, combo in enumerate(self.location_combos):
+            selected_loc = combo.currentData()
+            if selected_loc != "skip":
+                event_id = self.events[i]['id'];
+                changes.append((event_id, selected_loc))
+        return changes

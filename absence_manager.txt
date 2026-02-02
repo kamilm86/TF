@@ -1,0 +1,322 @@
+# absence_manager.py
+# -*- coding: utf-8 -*-
+
+from collections import defaultdict
+from PySide6.QtCore import QObject, Slot, Qt
+from PySide6.QtWidgets import (QMessageBox, QProgressDialog, QDialog, QVBoxLayout,
+                               QLabel, QTextEdit, QPushButton, QHBoxLayout, QWidget)
+from async_operations import CancelDelegationsThread
+from app_settings import app_settings
+from ui_utils import show_confirmation_dialog, AppStyles  # Import stylów
+from debug_utils import debug_print, log_error
+
+
+class ScrollableConflictDialog(QDialog):
+    """
+    Niestandardowe okno dialogowe z przewijaną listą konfliktów.
+    Wykorzystuje style aplikacji (ui_utils).
+    """
+
+    def __init__(self, parent, title, intro_text, details_html, question_text):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(500, 400)  # Domyślny rozmiar, można rozciągać
+
+        # --- Pobieranie stylów (Dark/Light mode) ---
+        is_dark = True
+        if parent:
+            if hasattr(parent, 'is_dark_theme'):
+                is_dark = parent.is_dark_theme
+            elif hasattr(parent, 'parent_widget') and hasattr(parent.parent_widget, 'is_dark_theme'):
+                is_dark = parent.parent_widget.is_dark_theme
+
+        theme = "dark" if is_dark else "light"
+
+        # Aplikujemy style okna
+        try:
+            dialog_style = AppStyles.get_dialog_style(theme)
+            self.setStyleSheet(dialog_style)
+        except Exception:
+            pass  # Fallback jeśli style nie zadziałają
+
+        layout = QVBoxLayout(self)
+
+        # 1. Tekst wprowadzający (np. "Wykryto kolizje...")
+        lbl_intro = QLabel(intro_text)
+        lbl_intro.setWordWrap(True)
+        # Zwiększamy nieco czcionkę nagłówka
+        f = lbl_intro.font()
+        f.setBold(True)
+        lbl_intro.setFont(f)
+        layout.addWidget(lbl_intro)
+
+        # 2. Przewijalny obszar ze szczegółami
+        self.details_box = QTextEdit()
+        self.details_box.setReadOnly(True)
+        self.details_box.setHtml(details_html)
+        self.details_box.setStyleSheet("QTextEdit { border: 1px solid #555; background-color: #2b2b2b; padding: 5px; }")
+        if theme == "light":
+            self.details_box.setStyleSheet(
+                "QTextEdit { border: 1px solid #ccc; background-color: #f5f5f5; color: black; padding: 5px; }")
+
+        layout.addWidget(self.details_box)
+
+        # 3. Pytanie końcowe
+        lbl_question = QLabel(question_text)
+        lbl_question.setWordWrap(True)
+        lbl_question.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl_question)
+
+        # 4. Przyciski
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.btn_yes = QPushButton("Tak, usuń i wstaw")
+        self.btn_no = QPushButton("Anuluj")
+
+        # Aplikacja stylów przycisków z ui_utils
+        try:
+            btn_style = AppStyles.get_button_style(theme)
+            self.btn_yes.setStyleSheet(btn_style)
+            self.btn_no.setStyleSheet(btn_style)
+        except:
+            pass
+
+        self.btn_yes.clicked.connect(self.accept)
+        self.btn_no.clicked.connect(self.reject)
+
+        btn_layout.addWidget(self.btn_yes)
+        btn_layout.addWidget(self.btn_no)
+        layout.addLayout(btn_layout)
+
+
+class AbsenceWorkflowManager(QObject):
+    """
+    Menedżer sterujący bezpiecznym wstawianiem nieobecności.
+    Prezentuje pogrupowane konflikty w przewijanym oknie.
+    """
+
+    def __init__(self, parent_window, data_provider):
+        super().__init__(parent_window)
+        self.parent = parent_window
+        self.data_provider = data_provider
+
+        # Stan operacji
+        self._pending_cells = []
+        self._pending_symbol = ""
+        self._success_callback = None
+
+        self._cancellation_thread = None
+        self._progress_dialog = None
+
+    def execute_safe_insertion(self, cells_data: list, symbol: str, success_callback, warning_msg: str = ""):
+        """
+        Główna metoda startowa.
+        """
+        debug_print(f"[AbsenceManager] === EXECUTE_SAFE_INSERTION CALLED ===")
+        debug_print(f"[AbsenceManager] Symbol: {symbol}, Cells count: {len(cells_data)}")
+        if cells_data:
+            c0 = cells_data[0]
+            debug_print(f"[AbsenceManager] First cell: uid={c0.get('uzytkownik_id')}, date={c0.get('date_str')}")
+        
+        self._pending_cells = cells_data
+        self._pending_symbol = symbol
+        self._success_callback = success_callback
+
+        # 1. Sprawdź czy to absencja (tylko one gryzą się ze spotkaniami)
+        if symbol not in app_settings.get_absence_symbols():
+            debug_print(f"[AbsenceManager] Symbol '{symbol}' NOT in absence symbols, skipping conflict check.")
+            self._trigger_callback()
+            return
+
+        debug_print(f"[AbsenceManager] Symbol '{symbol}' IS an absence symbol, detecting conflicts...")
+        # 2. Wykryj konflikty (z doklejonymi danymi UI)
+        conflicts = self._detect_conflicts(cells_data)
+
+        # 3. Decyzja
+        if not conflicts:
+            if warning_msg:
+                # Jeśli są tylko ostrzeżenia (np. o urlopie), używamy zwykłego dialogu
+                full_msg = f"{warning_msg}<br><br>Czy kontynuować?"
+                if show_confirmation_dialog(self.parent, "Potwierdzenie", full_msg, QMessageBox.Yes) == QMessageBox.Yes:
+                    self._trigger_callback()
+            else:
+                self._trigger_callback()
+        else:
+            # Pokaż pogrupowane szczegóły w nowym oknie
+            self._handle_cleanup_process(conflicts, warning_msg)
+
+    def _detect_conflicts(self, cells_data: list) -> list:
+        """
+        Skanuje bazę i zwraca listę zdarzeń do usunięcia.
+        Próbuje znaleźć dokładną nazwę/opis zdarzenia.
+        """
+        conflicting_events = []
+        BLOCKING_TYPES = {'Spotkanie', 'Szkolenie', 'Nadgodziny'}
+
+        processed_event_ids = set()
+
+        for cell in cells_data:
+            u_id = cell.get('uzytkownik_id')
+            d_str = cell.get('date_str')
+            user_name = cell.get('uzytkownik_dane', 'Nieznany')
+
+            # Active_only=True
+            events = self.data_provider.get_events_for_user_date(u_id, d_str, active_only=True)
+            debug_print(f"[AbsenceManager] U={u_id} D={d_str} Events={len(events)}")
+            for e in events:
+                debug_print(f" -> Evt: ID={e.get('id')} Type={e.get('type')} Status={e.get('evt_status')}")
+
+            for event in events:
+                evt_id = event.get('id')
+                # Typ ogólny (np. Szkolenie)
+                evt_type_raw = event.get('type') or event.get('evt_type')
+
+                if evt_type_raw in BLOCKING_TYPES and evt_id not in processed_event_ids:
+                    # --- FILTROWANIE STATUSU ---
+                    # UserReq 1 & 2: 
+                    # - Pokazujemy tylko zdarzenia INNE niż "Do delegacji"
+                    # - UPDATE (czyli też pokazywanie do usunięcia) tylko dla Status = 1 ("Delegowany")
+                    # Rozróżniamy typy, bo Nadgodziny mogą mieć inne statusy.
+                    
+                    status_nazwa = event.get('evt_status') # StatusNazwa z SQL, zmapowane w DataProvider
+                    
+                    if evt_type_raw in ['Spotkanie', 'Szkolenie']:
+                        # Jeśli status to "Do delegacji", to ignorujemy (jest to tylko propozycja)
+                        if status_nazwa == 'Do delegacji':
+                            continue
+                            
+                        # ZMIANA: Usuwam filtrowanie status_nazwa != 'Delegowany'. 
+                        # Konflikt jest konfliktem niezależnie od statusu (np. "Zatwierdzony", "Nowy").
+                        # Jeśli zdarzenie istnieje i nie jest anulowane (active_only=True), to blokuje grafik.
+                        # if status_nazwa != 'Delegowany':
+                        #    continue
+
+                    # --- LOGIKA WYCIĄGANIA NAZWY ---
+                    # UserReq 3: Pokazujemy Nazwę zdarzenia a nie jego typ
+                    
+                    # Priorytet: Nazwa -> Temat -> Opis -> Typ
+                    raw_name = event.get('evt_name') or event.get('name')
+                    raw_topic = event.get('evt_topic') or event.get('temat') or event.get('title')
+                    
+                    display_text = ""
+                    if raw_name and str(raw_name).strip():
+                        display_text = str(raw_name)
+                    elif raw_topic and str(raw_topic).strip():
+                        display_text = str(raw_topic)
+                    else:
+                        details = (event.get('description') or event.get('opis') or "")
+                        if details:
+                             display_text = details
+                        else:
+                             display_text = evt_type_raw # Fallback do typu
+
+                    # Formatowanie: "Nazwa (Typ)"
+                    # display_name = f"<b>{display_text}</b> <span style='color:#888'>({evt_type_raw})</span>"
+                    
+                    # Prostsza wersja: Po prostu nazwa (jak chciał User)
+                    display_name = f"<b>{display_text}</b>"
+
+                    # Doklejamy dane do wyświetlania
+                    event['_ui_user_name'] = user_name
+                    event['_ui_date'] = d_str
+                    event['_ui_display_name'] = display_name
+
+                    conflicting_events.append(event)
+                    processed_event_ids.add(evt_id)
+
+        return conflicting_events
+
+    def _build_conflict_details_html(self, conflicts: list) -> str:
+        """
+        Tworzy treść HTML do ScrollableConflictDialog.
+        Grupuje: User -> Data -> Zdarzenia.
+        """
+        grouped = defaultdict(lambda: defaultdict(list))
+
+        for evt in conflicts:
+            user = evt.get('_ui_user_name', 'Nieznany')
+            date = evt.get('_ui_date', '?')
+            display_name = evt.get('_ui_display_name', 'Zdarzenie')
+
+            # Godziny
+            start = evt.get('start_time') or evt.get('time_start')
+            end = evt.get('end_time') or evt.get('time_end')
+
+            if start and end:
+                display_name += f" <small>({start}-{end})</small>"
+
+            grouped[user][date].append(display_name)
+
+        # Generowanie HTML
+        html_parts = []
+
+        # Sortujemy użytkowników alfabetycznie
+        for user in sorted(grouped.keys()):
+            html_parts.append(f"<h3 style='margin-bottom:2px; color:#4a90e2;'>{user}</h3>")
+            html_parts.append("<ul style='margin-top:0px;'>")
+
+            dates_dict = grouped[user]
+            for date in sorted(dates_dict.keys()):
+                events_list = dates_dict[date]
+                # Każde zdarzenie w nowej linii dla danej daty
+                for evt_desc in events_list:
+                    html_parts.append(f"<li><b>{date}</b>: {evt_desc}</li>")
+
+            html_parts.append("</ul><hr>")
+
+        return "".join(html_parts)
+
+    def _handle_cleanup_process(self, conflicts: list, extra_msg: str):
+        """Uruchamia Custom Dialog."""
+        count = len(conflicts)
+
+        # 1. Przygotuj dane
+        details_html = self._build_conflict_details_html(conflicts)
+
+        # 2. Teksty
+        intro = (f"{extra_msg}<br>" if extra_msg else "")
+        intro += (f"Wykryto {count} kolidujących zdarzeń.<br>"
+                  "Poniższe spotkania/szkolenia muszą zostać odwołane:")
+
+        question = f"Czy usunąć te zdarzenia i wstawić '{self._pending_symbol}'?"
+
+        # 3. Pokaż dedykowany dialog (Scrollable)
+        dialog = ScrollableConflictDialog(self.parent, "Konflikt w grafiku", intro, details_html, question)
+
+        if dialog.exec() != QDialog.Accepted:
+            return  # Anulowano
+
+        # 4. Jeśli OK -> Uruchom proces usuwania przez głównego menedżera (DelegationCanceler)
+        # Dzięki temu korzystamy ze sprawdzonej logiki odświeżania UI i ikon.
+        
+        # Definiujemy mały wrapper callbacka, bo DelegationCanceler zwraca argumenty
+        def cleanup_success_wrapper(count, affected_pairs):
+            debug_print(f"AbsenceManager: Wyczyszczono poprzez DelegationCanceler {count}. Kontynuuję wstawianie.")
+            
+            # ZMIANA: Bezpośrednie wymuszenie odświeżenia ikon w rodzicu (bypass sygnału)
+            if hasattr(self.parent, 'force_update_icons_view'):
+                self.parent.force_update_icons_view(change_type='cleanup_explicit')
+                
+            self._trigger_callback()
+
+        if hasattr(self.parent, 'delegation_canceler'):
+             # Uruchom w trybie "cichym" (bez osobnego komunikatu sukcesu), 
+             # bo zaraz i tak wstawimy absencję
+             self.parent.delegation_canceler.start_cancellation(
+                 conflicts, 
+                 on_success=cleanup_success_wrapper, 
+                 silent=True
+             )
+        else:
+             # Fallback (gdyby jakimś cudem nie było attributes)
+             log_error("AbsenceManager: Brak dostępu do delegation_canceler w rodzicu!")
+             QMessageBox.critical(self.parent, "Błąd", "Nie można uruchomić usuwania konfliktów.")
+
+    def _trigger_callback(self):
+        if self._success_callback:
+            try:
+                self._success_callback(self._pending_cells, self._pending_symbol)
+            except Exception as e:
+                log_error(f"AbsenceManager: Błąd callback: {e}")
+                QMessageBox.critical(self.parent, "Błąd", f"Błąd wstawiania:\n{e}")

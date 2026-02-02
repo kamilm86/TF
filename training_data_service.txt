@@ -1,0 +1,301 @@
+import re
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Tuple, Set, Optional
+from collections import defaultdict
+from debug_utils import debug_print, log_error
+from app_settings import app_settings
+
+class TrainingDataService:
+    """
+    Serwis odpowiedzialny za pobieranie i przetwarzanie danych szkoleniowych.
+    Działa na bazie instancji DataProvider, pobierając eventy i parsując tagi.
+    """
+
+    # Regex do wykrywania tagów szkoleń: #NAZWA (np. #WSTĘPNE, #PRE1, #SZKOLENIE_BHP)
+    # Grupa 1 to nazwa kategorii
+    TAG_PATTERN = re.compile(r"#([\wąęćłńóśźżĄĘĆŁŃÓŚŹŻ]+)", re.IGNORECASE)
+
+    def __init__(self, data_provider):
+        self.data_provider = data_provider
+
+    def _get_months_range(self, start_date: date, end_date: date) -> List[Tuple[int, int]]:
+        """Zwraca listę krotek (rok, miesiąc) dla podanego zakresu dat."""
+        months = set()
+        # Iterujemy od pierwszego dnia miesiąca startowego
+        curr = start_date.replace(day=1)
+        while curr <= end_date:
+            months.add((curr.year, curr.month))
+            # Przejdź do następnego miesiąca
+            # Dodajemy 32 dni, żeby na pewno przeskoczyć do kolejnego miesiąca, potem ustawiamy dzień na 1
+            next_month = curr + timedelta(days=32)
+            curr = next_month.replace(day=1)
+        return sorted(list(months))
+
+    def fetch_training_summary(self, start_date: date, end_date: date) -> Tuple[List[str], Dict[int, Dict]]:
+        """
+        Pobiera metodę z podanego zakresu i zwraca:
+        1. Listę znalezionych unikalnych kategorii.
+        2. Słownik danych: { 
+             user_id: { 
+               'user_display': str, 
+               'categories': { 
+                  'TAG': { 'total_hours': float, 'events': [List[Dict]] } 
+               } 
+             } 
+           }
+        """
+        debug_print(f"TrainingDataService: Pobieranie danych za okres {start_date} - {end_date}")
+        
+        months_to_fetch = self._get_months_range(start_date, end_date)
+        
+        all_categories = set()
+        user_stats = defaultdict(lambda: {
+            'user_display': 'Nieznany', 
+            'categories': defaultdict(lambda: {'total_hours': 0.0, 'events': []})
+        })
+
+        for year, month in months_to_fetch:
+            try:
+                events = self.data_provider.get_events_data(year, month, 0, 0)
+                self._process_events_batch(events, start_date, end_date, user_stats, all_categories)
+            except Exception as e:
+                log_error(f"TrainingDataService: Błąd pobierania zdarzeń dla {year}-{month}: {e}", exception=e)
+
+        # Post-processing: Group raw events into "Training Instances" (Koszyki)
+        self._finalize_grouping(user_stats)
+        
+        # Calculate completion metrics against targets
+        self._calculate_metrics(user_stats)
+
+        return sorted(list(all_categories)), dict(user_stats)
+
+    def _calculate_metrics(self, user_stats: Dict):
+        """Oblicza metryki (postęp, status) dla każdej kategorii."""
+        for user_id, user_data in user_stats.items():
+            for tag, cat_data in user_data['categories'].items():
+                target = app_settings.get_training_target(tag)
+                
+                # Faktyczne dane
+                real_hours = cat_data.get('total_hours', 0.0)
+                # Count days from grouped instances (sum of sub_events_count) 
+                # OR count unique days from raw events? 
+                # Since we grouped them, summing sub_events_count from instances is a good proxy for "days present"
+                # assuming raw events are daily chunks.
+                grouped_events = cat_data.get('events', [])
+                real_days = sum(e.get('sub_events_count', 1) for e in grouped_events)
+                
+                # Targets
+                target_h = target.get('hours', 8.0)
+                target_d = target.get('days', 1)
+                
+                # Progress
+                pct_h = (real_hours / target_h) * 100.0 if target_h > 0 else 100.0
+                pct_d = (real_days / target_d) * 100.0 if target_d > 0 else 100.0
+                
+                # Final progress (Weighted? Or just min/max? Usually hours are key)
+                # Let's use Hours as primary progress driver
+                final_pct = min(pct_h, 100.0)
+                
+                # Status
+                if final_pct >= 100:
+                    status = "UKOŃCZONA"
+                elif final_pct > 0:
+                    status = "W TRAKCIE"
+                else:
+                    status = "ZAPLANOWANA"
+                    
+                cat_data.update({
+                    'target_hours': target_h,
+                    'target_days': target_d,
+                    'real_days': real_days,
+                    'progress_percent': final_pct,
+                    'status': status,
+                    'full_name': target.get('name', tag)
+                })
+
+    def _finalize_grouping(self, user_stats: Dict):
+        """Grupuje surowe zdarzenia w logiczne instancje szkoleń (ciągłość dat)."""
+        for user_id, user_data in user_stats.items():
+            for tag, cat_data in user_data['categories'].items():
+                raw_events = cat_data.get('events', [])
+                if not raw_events:
+                    continue
+                
+                # Sort by date
+                raw_events.sort(key=lambda x: x.get('parsed_date', date.min))
+                
+                grouped_instances = []
+                current_bucket = []
+                
+                for evt in raw_events:
+                    if not current_bucket:
+                        current_bucket.append(evt)
+                        continue
+                    
+                    last_evt = current_bucket[-1]
+                    # Check continuity: Same Name AND gap <= 3 days?
+                    # Or just gap <= 1 day represents "continuous training"?
+                    # Let's assume Gap <= 3 days allows for weekend breaks.
+                    
+                    delta = (evt['parsed_date'] - last_evt['parsed_date']).days
+                    names_match = (evt.get('evt_name', '').strip().lower() == last_evt.get('evt_name', '').strip().lower())
+                    
+                    if delta <= 3 and names_match:
+                        current_bucket.append(evt)
+                    else:
+                        # Close bucket
+                        grouped_instances.append(self._create_instance_from_bucket(current_bucket))
+                        current_bucket = [evt]
+                
+                if current_bucket:
+                    grouped_instances.append(self._create_instance_from_bucket(current_bucket))
+                
+                # Replace raw events with grouped instances in the structure?
+                # Or keep both? UI expects 'events' key. Let's replace 'events' with instances list,
+                # BUT instances need to look like events (have date, etc) for the Model to work,
+                # OR we update the Model.
+                # Let's update data structure to have 'events' list be these instances.
+                cat_data['events'] = grouped_instances
+                # Recalculate total hours just in case? No, sum is already done.
+
+    def _create_instance_from_bucket(self, bucket: List[Dict]) -> Dict:
+        """Tworzy obiekt instancji szkolenia z listy zdarzeń."""
+        if not bucket:
+            return {}
+        
+        first = bucket[0]
+        last = bucket[-1]
+        
+        total_h = sum(e.get('duration', 0.0) for e in bucket)
+        
+        # Determine consolidated time string
+        # If single day: "08:00 - 16:00"
+        # If multiple: "08:00 - 16:00 (...)" or just empty?
+        time_str = f"{first.get('evt_time_from', '')} - {first.get('evt_time_to', '')}"
+        if len(bucket) > 1:
+            time_str += " (...)"
+            
+        instance = {
+            'evt_name': first.get('evt_name', ''), # Name from first element
+            'parsed_date': first.get('parsed_date'), # For sorting
+            'date_to': last.get('parsed_date'), # End date
+            'duration': total_h,
+            'evt_time_from': first.get('evt_time_from'),
+            'evt_time_to': time_str, # Hack to show logic in column
+            'is_grouped': len(bucket) > 1,
+            'sub_events_count': len(bucket)
+        }
+        return instance
+
+    def _process_events_batch(self, events: List[Dict], start_filter: date, end_filter: date, 
+                              stats_container: Dict, categories_set: Set[str]):
+        """Przetwarza listę eventów z jednego miesiąca, filtrując po datach i tagach."""
+        debug_print(f"DEBUG: Rozpoczynam przetwarzanie {len(events)} zdarzeń. Filtr: {start_filter} - {end_filter}")
+        
+        for event in events:
+            # Parsowanie daty eventu
+            try:
+                evt_data_raw = event.get('evt_date')
+                if not evt_data_raw:
+                    continue
+                
+                if isinstance(evt_data_raw, (date, datetime)):
+                    evt_date = evt_data_raw if isinstance(evt_data_raw, date) else evt_data_raw.date()
+                else:
+                    evt_date = datetime.strptime(str(evt_data_raw), '%Y-%m-%d').date()
+            except (ValueError, TypeError) as e:
+                # debug_print(f"DEBUG: Błąd daty dla zdarzenia {event.get('evt_id')}: {e}")
+                continue
+
+            # Filtr zakresu dat
+            if not (start_filter <= evt_date <= end_filter):
+                continue
+
+            # Sprawdź czy to szkolenie/spotkanie
+            name = event.get('evt_name') or ""
+            
+            # Szukaj tagów TYLKO w nazwie
+            tags = self.TAG_PATTERN.findall(name)
+            if not tags:
+                continue
+            
+            # Oblicz czas trwania
+            duration_hours = self._calculate_duration(event.get('evt_time_from'), event.get('evt_time_to'))
+            if duration_hours <= 0:
+                continue
+
+            user_id = event.get('evt_user_id')
+            user_display = event.get('evt_user_display') or f"User {user_id}"
+
+            # Aktualizuj statystyki
+            if user_id:
+                user_entry = stats_container[user_id]
+                user_entry['user_display'] = user_display
+                
+                for tag in tags:
+                    tag_upper = tag.upper()
+                    categories_set.add(tag_upper)
+                    
+                    cat_entry = user_entry['categories'][tag_upper]
+                    cat_entry['total_hours'] += duration_hours
+                    
+                    # Store rich event data for drill-down
+                    # We add parsed date for sorting later
+                    event['parsed_date'] = evt_date
+                    event['duration'] = duration_hours
+                    cat_entry['events'].append(event)
+
+    def _calculate_duration(self, time_from: str, time_to: str) -> float:
+        """Oblicza czas trwania w godzinach na podstawie stringów HH:MM lub HH:MM:SS."""
+        if not time_from or not time_to:
+            return 0.0
+        
+        # Helper inner function to parse time
+        def parse_time(t_str):
+            t_str = str(t_str).strip()
+            # Try ISO format/full datetime first (sometimes comes from SQL)
+            if ' ' in t_str:  
+                # e.g. "2025-01-01 12:00:00" -> extract time
+                try:
+                    return datetime.fromisoformat(t_str) # returns datetime
+                except ValueError:
+                    pass
+                try:
+                    return datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    pass
+
+            # Try HH:MM:SS
+            try:
+                return datetime.strptime(t_str, '%H:%M:%S')
+            except ValueError:
+                pass
+            
+            # Try HH:MM
+            try:
+                return datetime.strptime(t_str, '%H:%M')
+            except ValueError:
+                pass
+                
+            return None
+
+        try:
+            t1 = parse_time(time_from)
+            t2 = parse_time(time_to)
+            
+            if not t1 or not t2:
+                debug_print(f"DEBUG: Nie udało się sparsować czasu: {time_from} -> {time_to}")
+                return 0.0
+            
+            # If we got full datetimes, we might need to be careful if they are on different days?
+            # Assuming here we care only about hours difference irrelevant of date part if it's purely time storage
+            # But if parse_time returned datetime with 1900-01-01 (default for strptime time-only), diff works fine.
+            
+            # Normalize to avoid date issues if one has date and other doesn't (unlikely if same source)
+            # Better: if they are datetime objects, calculate diff. 
+            
+            diff = t2 - t1
+            return diff.total_seconds() / 3600.0
+        except Exception as e:
+            debug_print(f"DEBUG: Błąd obliczania czasu {time_from}-{time_to}: {e}")
+            return 0.0

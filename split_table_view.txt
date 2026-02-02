@@ -1,0 +1,522 @@
+# split_table_view.py
+
+from PySide6.QtWidgets import (QWidget, QTableView, QVBoxLayout, QHBoxLayout,
+                               QSplitter, QHeaderView, QAbstractItemView, QScrollBar, QSizePolicy,
+                               QTableWidgetSelectionRange, QApplication)
+from PySide6.QtCore import Qt, Signal, QItemSelectionModel, QEvent, QModelIndex, QItemSelection, QTimer
+from debug_utils import debug_print
+from styles import AppStyles
+
+
+class SplitTableView(QWidget):
+    """
+    Widget zawierający dwa zsynchronizowane widoki tabeli.
+    Wersja z nową, niezawodną logiką obsługi nagłówka grafiku.
+    """
+    selection_changed = Signal()
+    day_sort_requested = Signal(int, Qt.SortOrder)
+    generic_sort_requested = Signal(str, Qt.SortOrder)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
+
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.employees_view = QTableView()
+        self.schedule_view = QTableView()
+
+        # Konfiguracja tabeli pracowników (employees_view)
+        # --- ZMIANA: Zezwól na zaznaczanie pojedynczych komórek, a nie całych wierszy ---
+        self.employees_view.setSelectionBehavior(QAbstractItemView.SelectItems)
+        # --- KONIEC ZMIANY ---
+        self.employees_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.employees_view.verticalHeader().setVisible(True)
+        self.employees_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.employees_view.verticalHeader().setDefaultSectionSize(25)
+        self.employees_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.employees_view.verticalHeader().setMinimumSectionSize(20)
+        self.employees_view.horizontalHeader().setFixedHeight(35)
+        self.employees_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.employees_view.horizontalHeader().setSectionsClickable(True)
+
+        # Konfiguracja tabeli grafiku (schedule_view)
+        self.schedule_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.schedule_view.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.schedule_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.schedule_view.verticalHeader().setVisible(False)
+        self.schedule_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.schedule_view.verticalHeader().setDefaultSectionSize(25)
+        self.schedule_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.schedule_view.verticalHeader().setMinimumSectionSize(15)
+        self.schedule_view.horizontalHeader().setFixedHeight(35)
+
+        # ZMIANA: Wyłączamy wbudowane sortowanie, aby przejąć pełną kontrolę
+        self.schedule_view.setSortingEnabled(False)
+        self.schedule_view.horizontalHeader().setSectionsClickable(True)
+
+        self.employees_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.employees_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.schedule_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+
+        self.splitter.addWidget(self.employees_view)
+        self.splitter.addWidget(self.schedule_view)
+        self.main_layout.addWidget(self.splitter)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+
+        self._is_updating = False
+        self._model = None
+        self._sync_timer = QTimer()
+        self._sync_timer.setSingleShot(True)
+        self._sync_timer.timeout.connect(self._delayed_sync_heights)
+
+        # ZMIANA: Nowe atrybuty do ręcznego zarządzania sortowaniem
+        self._last_sorted_day_index = -1
+        self._current_day_sort_order = Qt.AscendingOrder
+
+        self._setup_simple_scrollbar_hiding()
+        self.schedule_view.horizontalHeader().setContextMenuPolicy(Qt.CustomContextMenu)
+
+        # ZMIANA: Jedno centralne połączenie dla wszystkich kliknięć w nagłówek grafiku
+        self.schedule_view.horizontalHeader().sectionClicked.connect(self._on_schedule_header_section_clicked)
+
+    def _on_schedule_header_section_clicked(self, logical_index: int):
+        """Obsługuje kliknięcia w nagłówek grafiku."""
+        header = self.schedule_view.horizontalHeader()
+
+        if QApplication.keyboardModifiers() & Qt.ControlModifier:
+            # ... (Obsługa Ctrl+Click bez zmian) ...
+            if logical_index != -1:
+                self._is_updating = True
+                schedule_sm = self.schedule_view.selectionModel()
+                employees_sm = self.employees_view.selectionModel()
+
+                schedule_sm.blockSignals(True)
+                employees_sm.blockSignals(True)
+
+                try:
+                    schedule_sm.clear()
+                    employees_sm.clear()
+                    self.schedule_view.selectColumn(logical_index)
+                    self.employees_view.selectAll()
+                finally:
+                    schedule_sm.blockSignals(False)
+                    employees_sm.blockSignals(False)
+                    self._is_updating = False
+
+                self.selection_changed.emit()
+                header.setSortIndicator(-1, Qt.AscendingOrder)
+                self._last_sorted_day_index = -1
+        else:
+            if not self._model: return
+
+            # Ustalenie kierunku sortowania
+            if self._last_sorted_day_index == logical_index:
+                self._current_day_sort_order = Qt.DescendingOrder if self._current_day_sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+            else:
+                self._current_day_sort_order = Qt.AscendingOrder
+
+            self._last_sorted_day_index = logical_index
+            header.setSortIndicator(logical_index, self._current_day_sort_order)
+
+            # --- DYNAMICZNE OBLICZANIE INDEKSÓW KOLUMN ---
+            employee_cols_count = len(self._model.get_visible_columns())
+            days_in_month_fixed = 31  # Model rezerwuje 31 slotów
+
+            day_col_start = employee_cols_count
+            day_col_end = employee_cols_count + days_in_month_fixed - 1
+
+            # Indeksy bazowe (Suma jest zaraz po dniach)
+            base_idx = employee_cols_count + days_in_month_fixed
+            total_hours_col = base_idx
+            balance_hours_col = base_idx + 1
+
+            # Dynamiczne indeksy dla opcjonalnych kolumn
+            current_idx = base_idx + 2
+            percent_morning_col = -1
+            percent_ho_col = -1
+            comment_col = -1
+
+            # WAŻNE: Kolejność musi być identyczna jak w schedule_model._update_column_structure
+            if self._model._show_percent_morning_column:
+                percent_morning_col = current_idx
+                current_idx += 1
+
+            if self._model._show_percent_ho_column:
+                percent_ho_col = current_idx
+                current_idx += 1
+
+            if self._model._show_comment_column:
+                comment_col = current_idx
+
+            col_id_to_sort = None
+
+            if day_col_start <= logical_index <= day_col_end:
+                day = logical_index - employee_cols_count + 1
+                if 1 <= day <= self._model._days_in_month:
+                    self.day_sort_requested.emit(day, self._current_day_sort_order)
+                else:
+                    header.setSortIndicator(-1, Qt.AscendingOrder)
+                    self._last_sorted_day_index = -1
+                return
+
+            elif logical_index == total_hours_col:
+                col_id_to_sort = "total_hours"
+
+            elif logical_index == balance_hours_col:
+                col_id_to_sort = "balance_hours"
+
+            elif logical_index == percent_morning_col:
+                col_id_to_sort = "percent_morning"
+
+            elif logical_index == percent_ho_col:
+                col_id_to_sort = "percent_ho"
+
+            elif logical_index == comment_col:
+                col_id_to_sort = "komentarz_grafik"
+
+            if col_id_to_sort:
+                self.generic_sort_requested.emit(col_id_to_sort, self._current_day_sort_order)
+
+    def _on_column_ctrl_clicked(self, logical_index: int):
+        """Obsługuje zaznaczenie całej kolumny po Ctrl+Click."""
+        self._is_updating = True
+        schedule_sm = self.schedule_view.selectionModel()
+        employees_sm = self.employees_view.selectionModel()
+
+        schedule_sm.blockSignals(True)
+        employees_sm.blockSignals(True)
+
+        try:
+            schedule_sm.clear()
+            employees_sm.clear()
+            self.schedule_view.selectColumn(logical_index)
+            self.employees_view.selectAll()
+        finally:
+            schedule_sm.blockSignals(False)
+            employees_sm.blockSignals(False)
+            self._is_updating = False
+
+        self.selection_changed.emit()
+
+    def _on_schedule_sort_changed(self, logical_index, order):
+        """Obsługuje żądanie sortowania po kliknięciu w nagłówek dnia (bez Ctrl)."""
+        if not self._model: return
+        employee_cols_count = len(self._model.get_visible_columns())
+
+        if logical_index >= employee_cols_count:
+            day = logical_index - employee_cols_count + 1
+            if 1 <= day <= self._model._days_in_month:
+                self.day_sort_requested.emit(day, order)
+
+    def set_header_height(self, height):
+        self.employees_view.horizontalHeader().setFixedHeight(height)
+        self.schedule_view.horizontalHeader().setFixedHeight(height)
+
+    def set_schedule_columns_width(self):
+        if not self._model:
+            return
+        total_columns = self.schedule_view.model().columnCount()
+        for col in range(total_columns - 1):
+            self.schedule_view.setColumnWidth(col, 60)
+        self.schedule_view.setColumnWidth(total_columns - 1, 70)
+
+    def rowCount(self):
+        return self.employees_view.model().rowCount() if self.employees_view.model() else 0
+
+    def columnCount(self):
+        if not self.employees_view.model():
+            return 0
+        return self.employees_view.model().columnCount() + self.schedule_view.model().columnCount()
+
+    def _connect_signals(self):
+        self._sync_vertical_scrollbars()
+        if self.employees_view.model() and self.schedule_view.model():
+            self._sync_row_selection()
+        self._force_sync_heights()
+
+    def _setup_simple_scrollbar_hiding(self):
+        self.employees_view.verticalScrollBar().setStyleSheet("QScrollBar:vertical { width: 0px; }")
+        h_scrollbar = self.employees_view.horizontalScrollBar()
+        if h_scrollbar:
+            h_scrollbar.setStyleSheet("""
+                QScrollBar:horizontal {
+                    height: 12px;
+                    background: transparent;
+                    border: none;
+                }
+                QScrollBar::handle:horizontal,
+                QScrollBar::add-line:horizontal,
+                QScrollBar::sub-line:horizontal,
+                QScrollBar::add-page:horizontal,
+                QScrollBar::sub-page:horizontal {
+                    background: transparent;
+                    border: none;
+                }
+            """)
+            h_scrollbar.setRange(0, 0)
+
+    def _sync_vertical_scrollbars(self):
+        employees_vbar = self.employees_view.verticalScrollBar()
+        schedule_vbar = self.schedule_view.verticalScrollBar()
+
+        def sync_employees_to_schedule():
+            if not self._is_updating:
+                self._is_updating = True
+                schedule_vbar.setValue(employees_vbar.value())
+                self._is_updating = False
+
+        def sync_schedule_to_employees():
+            if not self._is_updating:
+                self._is_updating = True
+                employees_vbar.setValue(schedule_vbar.value())
+                self._is_updating = False
+
+        employees_vbar.valueChanged.connect(sync_employees_to_schedule)
+        schedule_vbar.valueChanged.connect(sync_schedule_to_employees)
+        self._sync_horizontal_scrollbar_visibility()
+
+    def _sync_row_selection(self):
+        if not self.employees_view.selectionModel() or not self.schedule_view.selectionModel():
+            return
+        self.employees_view.selectionModel().selectionChanged.connect(self._on_employees_selection_changed)
+        self.schedule_view.selectionModel().selectionChanged.connect(self._on_schedule_selection_changed)
+
+    def _on_schedule_selection_changed(self, selected, deselected):
+        """Synchronizuje zaznaczenie z tabeli grafiku do tabeli pracowników."""
+        if not self._is_updating:
+            self._is_updating = True
+            try:
+                # Zbierz unikalne wiersze zaznaczone w tabeli grafiku
+                rows = set(index.row() for index in self.schedule_view.selectionModel().selectedIndexes())
+
+                # Wyczyść zaznaczenie w tabeli pracowników
+                self.employees_view.selectionModel().clearSelection()
+
+                # Zaznacz odpowiednie wiersze w tabeli pracowników
+                for row in rows:
+                    left = self.employees_view.model().index(row, 0)
+                    right = self.employees_view.model().index(row, self.employees_view.model().columnCount() - 1)
+                    row_selection = QItemSelectionModel.Select | QItemSelectionModel.Rows
+                    self.employees_view.selectionModel().select(QItemSelection(left, right), row_selection)
+
+                self.selection_changed.emit()
+            finally:
+                self._is_updating = False
+
+    def _on_employees_selection_changed(self, selected, deselected):
+        if not self._is_updating:
+            self._is_updating = True
+            try:
+                selection = self.employees_view.selectionModel().selection()
+                self.schedule_view.selectionModel().clearSelection()
+                for index_range in selection:
+                    for row in range(index_range.top(), index_range.bottom() + 1):
+                        left = self.schedule_view.model().index(row, 0)
+                        right = self.schedule_view.model().index(row, self.schedule_view.model().columnCount() - 1)
+                        row_selection = QItemSelectionModel.Select | QItemSelectionModel.Rows
+                        self.schedule_view.selectionModel().select(QItemSelection(left, right), row_selection)
+                self.selection_changed.emit()
+            finally:
+                self._is_updating = False
+
+    # def _on_schedule_header_clicked(self, logical_index: int):
+    #     model = self.employees_view.model()
+    #     if model and model.rowCount() > 0:
+    #         self.employees_view.selectAll()
+
+    def _on_scrollbar_range_changed(self, min_val, max_val):
+        self._sync_timer.start(50)
+
+    def _force_sync_heights(self, row_height=25):
+        if not self.employees_view.model():
+            return
+        row_count = self.employees_view.model().rowCount()
+        for row in range(row_count):
+            self.employees_view.setRowHeight(row, row_height)
+            self.schedule_view.setRowHeight(row, row_height)
+
+    def _delayed_sync_heights(self):
+        self._force_sync_heights()
+
+    def set_model(self, model):
+        self._model = model
+        if model:
+            visible_columns = model.get_visible_columns()
+            employee_columns_count = len(visible_columns)
+            self.employees_view.setModel(model)
+            self.schedule_view.setModel(model)
+            if hasattr(self.parent(), 'is_dark_theme'):
+                theme = "dark" if self.parent().is_dark_theme else "light"
+                self.employees_view.setStyleSheet(AppStyles.get_table_style(theme))
+                self.schedule_view.setStyleSheet(AppStyles.get_table_style(theme))
+            for col in range(model.columnCount()):
+                if col < employee_columns_count:
+                    self.employees_view.showColumn(col)
+                    self.schedule_view.hideColumn(col)
+                else:
+                    self.employees_view.hideColumn(col)
+                    self.schedule_view.showColumn(col)
+            self._set_column_widths()
+            self.employees_view.setSortingEnabled(True)
+            self._force_sync_heights()
+            self._connect_signals()
+
+    def setup_columns(self):
+        """
+        Konfiguruje widoczność kolumn w obu tabelach na podstawie danych z modelu.
+        Ta metoda jest bezpieczna do wywołania po zmianie konfiguracji kolumn w modelu.
+        """
+        if not self._model:
+            return
+
+        debug_print("[DEBUG] SplitTableView: setup_columns - START")
+        visible_employee_cols = self._model.get_visible_columns()
+        employee_columns_count = len(visible_employee_cols)
+        total_model_cols = self._model.columnCount()
+
+        debug_print(
+            f"[DEBUG] SplitTableView: employee_columns_count={employee_columns_count}, total_model_cols={total_model_cols}")
+
+        for col in range(self._model.columnCount()):
+            is_employee_col = col < employee_columns_count
+            self.employees_view.setColumnHidden(col, not is_employee_col)
+            self.schedule_view.setColumnHidden(col, is_employee_col)
+            # Loguj tylko te 'dziwne' przypadki na końcu tabeli
+            if col >= total_model_cols - 5:
+                hidden_in_schedule = self.schedule_view.isColumnHidden(col)
+                header_text = self._model.headerData(col, Qt.Horizontal, Qt.DisplayRole)
+                debug_print(
+                    f"[DEBUG] Col {col} ('{header_text.replace(chr(10), ' ')}'): Hidden in ScheduleView? {hidden_in_schedule}")
+
+        self._set_column_widths()
+        debug_print("[DEBUG] SplitTableView: setup_columns - END")
+
+    def adjust_employees_table_width(self):
+        if not self._model: return
+        target_width = 0
+        visible_cols = self._model.get_visible_columns()
+        for col_idx in range(len(visible_cols)):
+            if not self.employees_view.isColumnHidden(col_idx):
+                target_width += self.employees_view.columnWidth(col_idx)
+        target_width += 40
+        total_splitter_width = self.splitter.width()
+        right_panel_width = total_splitter_width - target_width
+        self.splitter.setSizes([target_width, right_panel_width])
+
+    def setRowCount(self, count):
+        if hasattr(self, 'employees_view') and self.employees_view.model() and hasattr(self._model, 'setRowCount'):
+            self._model.setRowCount(count)
+
+    def selectedRanges(self):
+        if hasattr(self, 'schedule_view') and self.schedule_view:
+            selection_model = self.schedule_view.selectionModel()
+            if selection_model:
+                selected_indexes = selection_model.selectedIndexes()
+                if selected_indexes:
+                    row_groups = {}
+                    for index in selected_indexes:
+                        row = index.row()
+                        if row not in row_groups: row_groups[row] = []
+                        row_groups[row].append(index.column())
+                    ranges = []
+                    for row, columns in row_groups.items():
+                        if columns:
+                            min_col, max_col = min(columns), max(columns)
+                            ranges.append(QTableWidgetSelectionRange(row, min_col, row, max_col))
+                    return ranges
+        return []
+
+    def _set_column_widths(self):
+        if not self._model: return
+        visible_columns = self._model.get_visible_columns()
+        all_columns = self._model._employee_columns
+        column_info = {col_id: (name, width) for col_id, name, width in all_columns}
+        for col_idx, col_id in enumerate(visible_columns):
+            width = column_info.get(col_id, (None, 100))[1]
+            self.employees_view.setColumnWidth(col_idx, width)
+        days_in_month = self._model._days_in_month if hasattr(self._model, '_days_in_month') else 31
+        for day in range(1, days_in_month + 2):
+            self.schedule_view.setColumnWidth(day - 1, 65)
+        if days_in_month > 0:
+            self.schedule_view.setColumnWidth(days_in_month, 50)
+            self.schedule_view.setColumnWidth(days_in_month + 1, 50)
+
+    def get_selected_rows(self):
+        return sorted(set(index.row() for index in self.employees_view.selectionModel().selectedIndexes()))
+
+    def get_selected_cells(self):
+        return [(index.row(), index.column()) for index in self.schedule_view.selectionModel().selectedIndexes()]
+
+    def get_data_for_selected_cells(self):
+        if not self._model: return []
+        indexes = self.schedule_view.selectionModel().selectedIndexes()
+        cells_data = []
+        for index in indexes:
+            data = self._model.data(index, Qt.UserRole)
+            if data and isinstance(data, dict) and 'date_str' in data and 'uzytkownik_id' in data:
+                cells_data.append(data)
+        return cells_data
+
+    def clear(self):
+        if self.employees_view.selectionModel(): self.employees_view.selectionModel().clearSelection()
+        if self.schedule_view.selectionModel(): self.schedule_view.selectionModel().clearSelection()
+
+    def set_data_at(self, row, col, value):
+        if not self._model: return False
+        index = self._model.index(row, col)
+        return self._model.setData(index, value, Qt.EditRole) if index.isValid() else False
+
+    def get_global_column_index(self, table, column):
+        if not self._model: return -1
+        if table == 'employees': return column
+        if table == 'schedule': return column + len(self._model.get_visible_columns())
+        return -1
+
+    def update_cell_icon(self, row, day, has_meeting=False, has_training=False, has_overtime=False):
+        if not self._model: return
+        col = len(self._model.get_visible_columns()) + day - 1
+        index = self._model.index(row, col)
+        cell_data = self._model.data(index, Qt.UserRole)
+        if not isinstance(cell_data, dict): return
+        updated_data = cell_data.copy()
+        updated_data.update({'has_meeting': has_meeting, 'has_training': has_training, 'has_overtime': has_overtime})
+        if hasattr(self._model, 'update_cell_data'):
+            self._model.update_cell_data(index, updated_data)
+        self.schedule_view.update(index)
+
+    def _sync_horizontal_scrollbar_visibility(self):
+        employees_hbar = self.employees_view.horizontalScrollBar()
+        schedule_hbar = self.schedule_view.horizontalScrollBar()
+        def sync_visibility():
+            if schedule_hbar and employees_hbar:
+                employees_hbar.setVisible(schedule_hbar.isVisible())
+        if schedule_hbar:
+            schedule_hbar.rangeChanged.connect(lambda: QTimer.singleShot(10, sync_visibility))
+        sync_visibility()
+
+    def get_column_widths(self) -> dict:
+        """Zwraca słownik z aktualnymi szerokościami widocznych kolumn pracowników."""
+        if not self._model:
+            return {}
+
+        widths = {}
+        visible_columns_ids = self._model.get_visible_columns()
+        for i, col_id in enumerate(visible_columns_ids):
+            widths[col_id] = self.employees_view.columnWidth(i)
+
+        return widths
+
+    def apply_column_widths(self, widths: dict):
+        """Ustawia szerokości kolumn na podstawie słownika {col_id: width}."""
+        if not self._model or not widths:
+            return
+
+        visible_columns_ids = self._model.get_visible_columns()
+        for i, col_id in enumerate(visible_columns_ids):
+            if col_id in widths:
+                # Ustaw szerokość dla kolumny o danym indeksie w lewej tabeli
+                self.employees_view.setColumnWidth(i, widths[col_id])
+        debug_print(f"Zastosowano {len(widths)} zapisanych szerokości kolumn.")

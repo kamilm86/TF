@@ -1,0 +1,309 @@
+# export_settings_to_db.py
+import json
+from collections import OrderedDict
+from db_connector import DatabaseConnector, SQL_OBJECTS
+from _version import __version__ as APP_VERSION
+
+def get_config_as_json(data, ensure_ascii=False, indent=4):
+    return json.dumps(data, ensure_ascii=ensure_ascii, indent=indent)
+
+def export_settings():
+    """Główna funkcja eksportująca wszystkie ustawienia aplikacji do bazy danych."""
+
+    # ========================================================================
+    #           DEFINICJE UPRAWNIEŃ (PERMISSIONS) Z OPISAMI
+    # ========================================================================
+    permissions = {
+        # Klucz: 'app_access'
+        # Opis: Ogólny dostęp do uruchomienia i korzystania z aplikacji. Role niewymienione tutaj nie będą mogły otworzyć programu.
+        'app_access': ['Pracownik WPR', 'Lider', 'Menadżer', 'Lider OUT', "Administrator", "Pracownik WPiS"],
+
+        # Klucz: 'schedule_keyboard_edit'
+        # Opis: Zezwala na edycję komórek grafiku z klawiatury (wpisywanie godzin, symboli, modyfikacja godzin klawiszami +/-).
+        'schedule_keyboard_edit': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator"],
+
+        # Klucz: 'schedule_cell_actions'
+        # Opis: Dostęp do głównych przycisków akcji modyfikujących grafik, czyli "Wstaw zmianę" i "Wstaw nieobecność".
+        'schedule_cell_actions': ['Pracownik WPR', 'Lider OUT','Lider', "Administrator"],
+
+        # Klucz: 'button_add_overtime'
+        # Opis: Kontroluje widoczność przycisku "Dodaj nadgodziny".
+        'button_add_overtime': ['Pracownik WPR', "Administrator"],
+
+        # Klucz: 'button_staffing_details'
+        # Opis: Kontroluje widoczność przycisku "Obsada", który otwiera okno szczegółowych analiz.
+        'button_staffing_details': ['Pracownik WPR', "Administrator"],
+
+        # Klucz: 'button_show_audit'
+        # Opis: Kontroluje widoczność przycisku "Historia Zmian".
+        'button_show_audit': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator", 'Menadżer'],
+
+        # Klucz: 'button_schedule_control'
+        # Opis: Kontroluje widoczność przycisku "Zarządzaj Grafikiem", który pozwala na blokowanie i publikację grafiku.
+        'button_schedule_control': ['Pracownik WPR', 'Lider OUT', "Administrator"],
+
+        # Klucz: 'action_delete_symbol'
+        # Opis: Zezwala na usuwanie symboli z komórek za pomocą klawiszy Delete lub Backspace.
+        'action_delete_symbol': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator"],
+
+        # Klucz: 'view_schedule_comment_column'
+        # Opis: Sprawia, że w oknie wyboru kolumn pojawia się opcja włączenia kolumny "Komentarz do Grafiku".
+        'view_schedule_comment_column': ['Pracownik WPR', "Administrator"],
+
+        # Klucz: 'action_clear_special_symbol'
+        # Opis: Zezwala na użycie funkcji (domyślnie F12) do usunięcia tylko symbolu specjalnego (np. urlopu) bez usuwania godzin pracy.
+        'action_clear_special_symbol': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator"],
+
+        # Klucz: 'button_send_email'
+        # Opis: Kontroluje widoczność przycisku "Wyślij e-mail" do zaznaczonych pracowników.
+        'button_send_email': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator", 'Menadżer'],
+
+        # Klucz: 'view_schedule_percent_morning_column'
+        # Opis: Sprawia, że w oknie wyboru kolumn pojawia się opcja włączenia kolumny "Procent rano".
+        'view_schedule_percent_morning_column': ['Pracownik WPR', "Administrator"],
+
+        # --- NOWE UPRAWNIENIE ADMINISTRACYJNE ---
+        # Pozwala widzieć zakładkę "Administracja" w ustawieniach i zmieniać globalne flagi
+        'manage_app_configuration': ["Administrator"],
+
+        # --- NOWE UPRAWNIENIA (Dla przycisków edycji grafiku) ---
+        # Domyślnie NIE MA tu Menadżera, więc przyciski będą dla niego ukryte
+        'button_insert_change': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator"],
+        'button_insert_absence': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator"],
+        'button_cancel_delegation': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator"],
+        'button_location_exception': ['Pracownik WPR', 'Lider', "Administrator"],
+
+        # Pozwala na użycie przycisku "Odwołaj" w tabeli zdarzeń (dolny panel)
+        'action_cancel_event_from_table': ['Pracownik WPR', 'Lider OUT', 'Lider', "Administrator"],
+        'button_training_report': ['Pracownik WPR', 'Administrator', 'Lider', 'Lider OUT', 'Menadżer'],
+        # -- INNE --
+        'manage_group_definitions': ["Administrator", 'Pracownik WPR']
+    }
+
+    # Definicja symboli, które oznaczają świadczenie pracy (nie absencję)
+    work_like_symbols = ["DYS", "T", "BC", "S", "P", "PR", "PD", "HO", "DZ"]
+
+
+    # 2. Definicje symboli
+    symbol_categories = OrderedDict([
+        ("Zwolnienia", {
+            "CO": "Zwolnienie lekarskie",
+            "CR": "Zwolnienie na inną osobę",
+            "CRW": "Zwolnienie na opiekę (wyjątkowe)",
+            "CSR": "Świadczenie rehabilitacyjne",
+            "ZO": "Zwolnienie z obowiązku świadczenia pracy",
+            "ZS": "Zwolnienie z obowiązku świadczenia pracy (wyjątkowe)"
+        }),
+        ("Urlopy", {
+            "U": "Urlop wypoczynkowy",
+            "UZ": "Urlop na żądanie",
+            "UD": "Urlop dodatkowy dla osób z niepełnosprawnością",
+            "UB": "Urlop bezpłatny",
+            "UM": "Urlop macierzyński",
+            "UO": "Urlop okolicznościowy",
+            "UOD": "Opieka nad dzieckiem",
+            "US": "Urlop szkolny",
+            "UT": "Urlop ojcowski",
+            "UW": "Urlop wychowawczy",
+            "UOP": "Urlop opiekuńczy (5 dni)",
+            "USW": "Urlop z powodu siły wyższej (2 dni)",
+         }),
+        ("Delegacje i Inne", {
+            "DK": "Delegacja krajowa",
+            "DZ": "Delegacja zagraniczna",
+            "HO": "Home Office",
+            "P": "Czasowe oddelegowanie",
+            "PD": "Prace dodatkowe",
+            "PR": "",
+            "BC": "Backup",
+            "BK": "Badanie kontrolne",
+            "BO": "Badanie okresowe",
+            "CW": "Ćwiczenia wojskowe",
+            "DYS": "Dyspozycja",
+            "MW": "mWolne",
+            "NN": "Nieobecność nieusprawiedliwiona",
+            "NU": "Nieobecność usprawiedliwiona",
+            "NW": "Nieobecność do wyjaśnienia",
+            "O": "Odbiór godzin",
+            "OS": "Odbiór dnia wolnego za święto",
+            "S": "Szkolenie",
+            "T": "Testy",
+            "Z": "Rozwiązanie umowy"
+        })
+    ])
+
+    # --- NOWA SEKCJA: Definicja uprawnień do poszczególnych symboli ---
+    symbol_permissions = {
+        # Urlopy
+        "U": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UZ": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "UB": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UM": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "UO": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UOD": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "US": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UT": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "UW": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UOP": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "USW": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],  # Przeniesiono z "Inne" dla spójności
+
+        # Zwolnienia
+        "CO": ["Pracownik WPR", "Lider", "Lider OUT", "Administrator"], "CR": ["Pracownik WPR", "Lider", "Lider OUT", "Administrator"],
+        "CRW": ["Pracownik WPR", "Lider", "Lider OUT", "Administrator"], "CSR": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "ZO": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "ZS": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+
+        # Delegacje i Inne
+        "DK": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "DZ": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "HO": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "P": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "PD": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "BC": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "BK": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "BO": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "CW": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "DYS": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "MW": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "NN": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "NU": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "NW": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "O": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "OS": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "S": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "T": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "Z": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "PR": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"]
+
+    }
+
+    # 3. Definicje logiki biznesowej (wcześniej w BusinessRules)
+    absence_symbols = [
+        'U', 'UZ', 'UOP', 'CO', 'CR', 'UB', 'UM', 'UO', 'UOD', 'US', 'UT', 'UW',
+        'CRW', 'CSR', 'ZO', 'ZS', 'NN', 'NU', 'NW', 'O', 'OS', 'USW', 'Z'
+    ]
+
+    group_mapping = {
+        "TOTAL VOICE": ['WNT', 'WZK1v', 'WZK2v', 'WZK3v', 'WZK3w', 'WZFv'],
+        "MASS+WELCAMER+GOLD": ['WZKv', 'WZK3w', 'WNT', 'WZK1v', 'WZK2v', 'WZK3v'],
+        "NUMEN+FIRMA": ['WZFv', 'WZFc'],
+        "CZAT": ['WZFv', 'WZK3v', 'WZK3w', 'WZK1c', 'WZK2c', 'WZK3c', 'WZFc', 'OBDc'],
+        "WELCOMER": ['WZK3v', 'WZK3c', 'WZK3w'],
+        "GOLD": ['WZK2v', 'WZK2c'],
+        "NUMEN+FIRMA_VOICE": ['WZFv'],
+        "WELCOMER VOICE": ['WZK3v', 'WZK3w']
+    }
+
+    # 4. Inne ustawienia
+    shift_color_map = {
+        5: "#CCFFFF", 6: "#CCFFFF", 7: "#00FFFF", 8: "#00CCFF", 9: "#00FF00", 10: "#99CC00",
+        11: "#CCFFCC", 12: "#FFFF99", 13: "#FFCC99", 14: "#FF9900", 15: "#FF00FF", 16: "#CC0000",
+        17: "#969696", 18: "#969696", 19: "#969696", 20: "#969696", 21: "#969696",
+        22: "#1E1E1E", 23: "#1E1E1E", 0: "#1E1E1E", 1: "#1E1E1E", 2: "#1E1E1E", 3: "#1E1E1E", 4: "#1E1E1E"
+    }
+
+    # Zdefiniuj listy użytkowników Windows, dla których logowanie ma być aktywne.
+    # Jeśli lista jest pusta, logowanie będzie wyłączone.
+    logging_users_for_file = ["kamil"]  # <-- ZMIEŃ NA LISTĘ LOGINÓW
+    logging_users_for_console = ["kamil"]  # <-- ZMIEŃ NA LISTĘ LOGINÓW
+
+    # --- NOWA SEKCJA: Lista "Super Liderów" z rozszerzonymi uprawnieniami ---
+    super_lider_logins = [""]  # <-- TUTAJ WPISZ LOGINY LIDERÓW
+
+    # --- PODZIAŁ KONFIGURACJI ---
+
+    # 1. Ustawienia SZTYWNE (Systemowe) - Te ZAWSZE nadpisujemy przy update aplikacji.
+    # Są to definicje, bez których kod by się wywalił (np. wymagana wersja).
+    settings_enforced = {
+        "current_version": APP_VERSION,
+        "force_update": "false",
+        # SymbolPermissions wymuszamy aktualizację, bo w bazie mogą być stare/błędne dane
+        "SymbolPermissions": get_config_as_json(symbol_permissions),
+        "LoggingUserFile": ",".join(logging_users_for_file),
+        "LoggingUserConsole": ",".join(logging_users_for_console),
+        "SuperLiderLogins": ",".join(super_lider_logins)
+    }
+
+    # 2. Ustawienia INICJALIZACYJNE (Edytowalne) - Te zapisujemy TYLKO, jeśli baza jest pusta.
+    # Jeśli Admin zmienił je w aplikacji, skrypt ich NIE RUSZY.
+    settings_user_editable = {
+        "GroupMapping": get_config_as_json(group_mapping),
+        "AppPermissions": get_config_as_json(permissions),
+        # SymbolPermissions USUNIĘTE - przeniesione do settings_enforced
+        "ShiftColorMap": get_config_as_json(shift_color_map),
+        "AbsenceSymbolsLogic": get_config_as_json(absence_symbols),
+        "NotificationCenterEnabled": "true",
+    }
+
+    print("--- Rozpoczynam INTELIGENTNY eksport ustawień ---")
+    conn = None
+    try:
+        conn = DatabaseConnector.get_connection()
+        cursor = conn.cursor()
+        table_name = SQL_OBJECTS['appsettings']
+
+        # A. Aplikowanie ustawień SZTYWNYCH (Zawsze UPDATE/INSERT)
+        print("\n[SYSTEM] Aktualizacja wymuszona (Core):")
+        for key, value in settings_enforced.items():
+            sql = f"""
+                MERGE {table_name} AS target
+                USING (SELECT ? AS SettingKey, ? AS SettingValue) AS source
+                ON (target.SettingKey = source.SettingKey)
+                WHEN MATCHED THEN UPDATE SET target.SettingValue = source.SettingValue
+                WHEN NOT MATCHED THEN INSERT (SettingKey, SettingValue) VALUES (source.SettingKey, source.SettingValue);
+                """
+            cursor.execute(sql, (key, value))
+            print(f" -> Zaktualizowano: {key}")
+
+        # B. Aplikowanie ustawień EDYTOWALNYCH (Tylko INSERT IGNORE)
+        print("\n[USER] Inicjalizacja (tylko jeśli brak w bazie):")
+        for key, value in settings_user_editable.items():
+            # Sprawdź czy klucz już istnieje
+            cursor.execute(f"SELECT 1 FROM {table_name} WHERE SettingKey = ?", (key,))
+            exists = cursor.fetchone()
+
+            if not exists:
+                cursor.execute(f"INSERT INTO {table_name} (SettingKey, SettingValue) VALUES (?, ?)", (key, value))
+                print(f" -> WSTAWIONO (Nowy): {key}")
+            else:
+                print(f" -> POMINIĘTO (Istnieje): {key} - szanuję ustawienia Administratora.")
+
+        conn.commit()
+        print("\n--- Sukces! Baza jest gotowa i bezpieczna. ---")
+
+    except Exception as e:
+        print(f"\n!!! BŁĄD: {e}")
+    finally:
+        if conn: conn.close()
+        
+    # # 5. Finalny słownik do eksportu
+    # settings_to_export = {
+    #     "current_version": APP_VERSION,
+    #     "force_update": "false",
+    #     # --- NOWA GLOBALNA FLAGA ---
+    #     "NotificationCenterEnabled": "true",
+    #     "LoggingUserFile": ",".join(logging_users_for_file),
+    #     "LoggingUserConsole": ",".join(logging_users_for_console),
+    #     "AppPermissions": get_config_as_json(permissions),
+    #     "SymbolCategoriesDialog": get_config_as_json(symbol_categories),
+    #     "AbsenceSymbolsLogic": get_config_as_json(absence_symbols),
+    #     "GroupMapping": get_config_as_json(group_mapping),
+    #     "ShiftColorMap": get_config_as_json(shift_color_map),
+    #     "SymbolPermissions": get_config_as_json(symbol_permissions),
+    #     "WorkLikeSymbols": get_config_as_json(work_like_symbols),
+    #     "SuperLiderLogins": ",".join(super_lider_logins) # <-- NOWY WPIS
+    #
+    # }
+    #
+    # print("--- Rozpoczynam eksport ustawień do bazy danych ---")
+    # try:
+    #     conn = DatabaseConnector.get_connection()
+    #     cursor = conn.cursor()
+    #     table_name = SQL_OBJECTS['appsettings']
+    #
+    #     for key, value in settings_to_export.items():
+    #         print(f"Przetwarzanie klucza: '{key}'...")
+    #         sql = f"""
+    #         MERGE {table_name} AS target
+    #         USING (SELECT ? AS SettingKey, ? AS SettingValue) AS source
+    #         ON (target.SettingKey = source.SettingKey)
+    #         WHEN MATCHED THEN UPDATE SET target.SettingValue = source.SettingValue
+    #         WHEN NOT MATCHED THEN INSERT (SettingKey, SettingValue) VALUES (source.SettingKey, source.SettingValue);
+    #         """
+    #         cursor.execute(sql, (key, value))
+    #         print(f" -> Zakończono.")
+    #
+    #     conn.commit()
+    #     conn.close()
+    #     print("\n--- Eksport zakończony sukcesem! ---")
+    # except Exception as e:
+    #     print(f"\n--- WYSTĄPIŁ BŁĄD PODCZAS EKSPORTU ---\n{e}")
+
+
+if __name__ == "__main__":
+    export_settings()

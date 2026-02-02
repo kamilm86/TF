@@ -1,0 +1,709 @@
+# -*- coding: utf-8 -*-
+
+import datetime
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                               QPushButton, QGroupBox, QFrame, QGridLayout, QMessageBox, QListWidget, QAbstractItemView,
+                               QDateEdit, QDateTimeEdit, QProgressDialog)  # Dodano QProgressDialog
+from PySide6.QtCore import Qt, Signal, QDate, QDateTime
+from styles import AppStyles
+from db_connector import DatabaseConnector, get_modifier_id
+from ui_utils import show_confirmation_dialog
+from config import SQL_OBJECTS
+from debug_utils import log_error, debug_print
+
+# Nowe importy
+from async_operations import SuggestionImportThread
+from error_display_dialog import ErrorDisplayDialog
+
+
+# --- KLASA BlockingDateDialog (BEZ ZMIAN) ---
+class BlockingDateDialog(QDialog):
+    def __init__(self, parent=None, current_date=None):
+        super().__init__(parent)
+        self.setWindowTitle("Ustaw datę blokady")
+        self.is_dark_theme = getattr(parent, 'is_dark_theme', False)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Wybierz datę, do której plany urlopowe mają być zablokowane:"))
+
+        self.date_edit = QDateEdit(current_date or QDate.currentDate())
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        layout.addWidget(self.date_edit)
+
+        buttons_layout = QHBoxLayout()
+        self.ok_button = QPushButton("OK")
+        self.cancel_button = QPushButton("Anuluj")
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.cancel_button)
+        buttons_layout.addWidget(self.ok_button)
+
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+        layout.addLayout(buttons_layout)
+        self.apply_styles()
+
+    def get_selected_date(self):
+        return self.date_edit.date()
+
+    def apply_styles(self):
+        theme = "dark" if self.is_dark_theme else "light"
+        self.setStyleSheet(AppStyles.get_dialog_style(theme))
+        self.date_edit.setStyleSheet(AppStyles.get_date_edit_style(theme))
+        self.ok_button.setStyleSheet(AppStyles.get_button_style(theme))
+        self.cancel_button.setStyleSheet(AppStyles.get_button_style(theme))
+
+
+# --- ZAKTUALIZOWANA KLASA GŁÓWNEGO OKNA ---
+class ScheduleControlDialog(QDialog):
+    data_refresh_needed = Signal()
+
+    def __init__(self, parent, year, month):
+        super().__init__(None)
+        self.parent_widget = parent
+        self.year = year
+        self.month = month
+        self.is_dark_theme = getattr(parent, 'is_dark_theme', False)
+
+        self.setWindowFlags(
+            Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
+
+        user_app_id, _, _, _, login_windows = get_modifier_id()
+        self.user_app_id = user_app_id
+        self.login_windows = login_windows
+
+        self.data_provider = parent.data_provider
+        self.blocking_date = None
+
+        self.import_thread = None
+        self.error_dialog = None
+        # ZMIANA: Usunięto self.last_import_errors - nie jest już potrzebne
+        self.progress_dialog = None
+
+        self.setWindowTitle("Zarządzaj Grafikiem")
+        self.setup_ui()
+        self.connect_signals()
+        self.apply_styles()
+        self.load_initial_status()
+
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        self.status_box = QGroupBox("Aktualny status:")
+
+        status_layout = QHBoxLayout()
+        self.suggestions_status_label = QLabel("Ładowanie...")
+        self.suggestions_status_label.setAlignment(Qt.AlignCenter)
+        self.publish_status_label = QLabel("Ładowanie...")
+        self.publish_status_label.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.suggestions_status_label)
+        status_layout.addWidget(self.publish_status_label)
+        self.status_box.setLayout(status_layout)
+
+        suggestions_box = QGroupBox("Zmiana statusu sugestii")
+        suggestions_layout = QVBoxLayout()
+        self.unlock_button = QPushButton("Odblokowane")
+        self.lock_for_consultants_button = QPushButton("Zablokowane dla Konsultantów")
+        self.lock_for_consultants_support_button = QPushButton("Zablokowane dla Konsultantów i wsparcia")
+        suggestions_layout.addWidget(self.unlock_button)
+        suggestions_layout.addWidget(self.lock_for_consultants_button)
+        suggestions_layout.addWidget(self.lock_for_consultants_support_button)
+        suggestions_box.setLayout(suggestions_layout)
+
+        publish_box = QGroupBox("Publikacja grafiku")
+        publish_layout = QVBoxLayout()
+        self.publish_button = QPushButton("Publikacja grafiku")
+        self.unpublish_button = QPushButton("Cofnij publikację")
+        publish_layout.addWidget(self.publish_button)
+        publish_layout.addWidget(self.unpublish_button)
+        publish_box.setLayout(publish_layout)
+
+        right_panel_layout = QVBoxLayout()
+
+        blocking_box = QGroupBox("Blokowanie Planów Urlopowych (PU)")
+        blocking_layout = QVBoxLayout()
+
+        self.blocking_date_label = QLabel("Data blokady: Nie ustawiono")
+        self.blocking_date_label.setStyleSheet("font-weight: bold;")
+
+        blocking_controls_layout = QHBoxLayout()
+
+        self.blocking_date_edit = QDateTimeEdit(QDateTime.currentDateTime())
+        self.blocking_date_edit.setCalendarPopup(True)
+        self.blocking_date_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+
+        self.save_blocking_date_button = QPushButton("Ustaw datę blokady")
+
+        blocking_controls_layout.addWidget(self.blocking_date_edit)
+        blocking_controls_layout.addWidget(self.save_blocking_date_button)
+
+        blocking_layout.addWidget(self.blocking_date_label)
+        blocking_layout.addLayout(blocking_controls_layout)
+        blocking_box.setLayout(blocking_layout)
+
+        data_box = QGroupBox("Pobieranie danych")
+        data_layout = QVBoxLayout()
+        self.get_suggestions_button = QPushButton("Pobierz sugestie Konsultantów")
+
+        # --- ZMIANA: Zmiana nazwy i włączenie przycisku ---
+        self.view_logs_button = QPushButton("Pokaż historię błędów importu")
+        self.view_logs_button.setEnabled(True)  # Jest włączony domyślnie
+        # --- KONIEC ZMIANY ---
+
+        self.get_vacation_plans_button = QPushButton("Pobierz plany urlopowe")
+        data_layout.addWidget(self.get_suggestions_button)
+        data_layout.addWidget(self.view_logs_button)  # Dodany do layoutu
+        data_layout.addWidget(self.get_vacation_plans_button)
+        data_box.setLayout(data_layout)
+
+        right_panel_layout.addWidget(blocking_box)
+        right_panel_layout.addWidget(data_box)
+
+        grid_layout = QGridLayout()
+        grid_layout.addWidget(self.status_box, 0, 0, 1, 2)
+        grid_layout.addWidget(suggestions_box, 1, 0)
+        grid_layout.addWidget(publish_box, 2, 0)
+        grid_layout.addLayout(right_panel_layout, 1, 1, 2, 1)
+        main_layout.addLayout(grid_layout)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        main_layout.addWidget(separator)
+
+        close_button_layout = QHBoxLayout()
+        close_button_layout.addStretch()
+        self.close_button = QPushButton("Zamknij")
+        close_button_layout.addWidget(self.close_button)
+        main_layout.addLayout(close_button_layout)
+
+    def connect_signals(self):
+        self.close_button.clicked.connect(self.accept)
+        self.unlock_button.clicked.connect(self.unlock_suggestions)
+        self.lock_for_consultants_button.clicked.connect(self.lock_for_consultants)
+        self.lock_for_consultants_support_button.clicked.connect(self.lock_for_support)
+        self.publish_button.clicked.connect(self.publish_schedule)
+        self.unpublish_button.clicked.connect(self.unpublish_schedule)
+
+        self.get_suggestions_button.clicked.connect(self._start_suggestion_import)
+
+        # --- ZMIANA: Podłączenie do nowej metody ---
+        self.view_logs_button.clicked.connect(self._show_historical_logs)
+        # --- KONIEC ZMIANY ---
+
+        self.get_vacation_plans_button.clicked.connect(self.get_vacation_plans)
+        self.save_blocking_date_button.clicked.connect(self._save_blocking_date)
+
+    def set_current_theme(self, is_dark_theme: bool):
+        """Publiczna metoda do odświeżania motywu na żywo."""
+        if self.is_dark_theme != is_dark_theme:
+            self.is_dark_theme = is_dark_theme
+            self.apply_styles()
+
+            if hasattr(self, 'blocking_date_edit'):
+                calendar = self.blocking_date_edit.calendarWidget()
+                if calendar:
+                    calendar.setStyleSheet(AppStyles.get_calendar_style("dark" if is_dark_theme else "light"))
+
+            if self.error_dialog:
+                self.error_dialog.set_current_theme(is_dark_theme)
+
+    def apply_styles(self):
+        theme = "dark" if self.is_dark_theme else "light"
+
+        calendar_style = AppStyles.get_calendar_style(theme)
+        dialog_style = AppStyles.get_dialog_style(theme)
+
+        self.setStyleSheet(dialog_style + calendar_style)
+
+        for button in self.findChildren(QPushButton):
+            button.setStyleSheet(AppStyles.get_button_style(theme))
+
+        base_label_style = "font-weight: bold; border: 1px solid {color}; padding: 5px; color: {text_color}; background-color: {bg_color};"
+        if theme == "dark":
+            status_style = base_label_style.format(color=AppStyles.DARK_BORDER_PRIMARY,
+                                                   text_color=AppStyles.DARK_TEXT_PRIMARY,
+                                                   bg_color=AppStyles.DARK_BACKGROUND_CONTROLS)
+            blocking_label_style = f"font-weight: bold; color: {AppStyles.DARK_TEXT_PRIMARY};"
+        else:
+            status_style = base_label_style.format(color=AppStyles.LIGHT_BORDER_PRIMARY,
+                                                   text_color=AppStyles.LIGHT_TEXT_PRIMARY,
+                                                   bg_color=AppStyles.LIGHT_BACKGROUND_CONTROLS)
+            blocking_label_style = f"font-weight: bold; color: {AppStyles.LIGHT_TEXT_PRIMARY};"
+
+        self.suggestions_status_label.setStyleSheet(status_style)
+        self.publish_status_label.setStyleSheet(status_style)
+        self.blocking_date_label.setStyleSheet(blocking_label_style)
+
+        self.blocking_date_edit.setStyleSheet(AppStyles.get_date_edit_style(theme))
+
+        calendar = self.blocking_date_edit.calendarWidget()
+        if calendar:
+            calendar.setStyleSheet(calendar_style)
+
+    def get_vacation_plans(self):
+        """Obsługuje pobieranie planów urlopowych."""
+        reply = show_confirmation_dialog(self, "Potwierdzenie",
+                                         "Czy na pewno chcesz pobrać plany urlopowe dla wszystkich? Może to spowodować nadpisanie wprowadzonych już danych.",
+                                         default_button=QMessageBox.No)
+
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, '{self.login_windows}', NULL"
+            conn = DatabaseConnector.get_connection()
+            conn.execute(sql)
+            conn.commit()
+            conn.close()
+            QMessageBox.information(self, "Sukces", "Plany urlopowe zostały pobrane.")
+            self.data_refresh_needed.emit()
+        except Exception as e:
+            QMessageBox.critical(self, "Błąd Bazy Danych",
+                                 f"Wystąpił błąd podczas pobierania planów urlopowych:<br>{e}")
+
+    def _execute_procedure(self, sql_query):
+        """Pomocnicza metoda do wykonywania zapytań."""
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(sql_query)
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd:<br>{e}")
+            return False
+
+    def load_initial_status(self):
+        """Wczytuje i ustawia początkowy status z bazy oraz dynamiczny tytuł."""
+        try:
+            # Ustawienie dynamicznego tytułu
+            polish_months = [
+                "styczeń", "luty", "marzec", "kwiecień", "maj", "czerwiec",
+                "lipiec", "sierpień", "wrzesień", "październik", "listopad", "grudzień"
+            ]
+            month_name = polish_months[self.month - 1]
+            self.status_box.setTitle(f"Aktualny status grafiku na {month_name} {self.year}:")
+
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+
+            # --- NOWA LOGIKA Z DWOMA OSOBNYMI ZAPYTANIAMI ---
+
+            # 1. Pobranie statusu sugestii
+            self.suggestions_status_label.setText("Sugestie: Nieustawiony")
+            query_sug = f"SELECT Status FROM {SQL_OBJECTS['datyblokowaniasugestii']} WHERE Rok=? AND Miesiac=?"
+            sug_result = cursor.execute(query_sug, (self.year, self.month)).fetchone()
+            if sug_result:
+                status_code = sug_result[0]
+                status_map = {
+                    '0': "Sugestie: Odblokowane",
+                    '1': "Sugestie: Zablokowane dla Konsultantów",
+                    '2': "Sugestie: Zablokowane dla Konsultantów i Wsparcia"
+                }
+                self.suggestions_status_label.setText(status_map.get(status_code, "Sugestie: Nieznany status"))
+
+            # 2. Osobne pobranie daty blokady Planów Urlopowych (PU)
+            self.blocking_date_label.setText("Data blokady: Nie ustawiono")
+            self.blocking_date = None
+
+            # --- POCZĄTEK POPRAWKI ---
+            # Ustaw domyślny tekst przycisku
+            self.save_blocking_date_button.setText("Ustaw datę blokady")
+            # --- KONIEC POPRAWKI ---
+
+            first_day_of_month = datetime.date(self.year, self.month, 1)
+            query_block = f"SELECT DataBlokowania FROM {SQL_OBJECTS['datyblokowaniapu']} WHERE ZablokowanaData = ?"
+            block_date_row = cursor.execute(query_block, (first_day_of_month,)).fetchone()
+
+            if block_date_row and block_date_row[0]:
+                blocking_date = block_date_row[0]
+                # Sprawdzamy, czy zwrócona data jest prawidłowym obiektem datetime
+                if isinstance(blocking_date, datetime.datetime):
+                    self.blocking_date = blocking_date
+                    self.blocking_date_label.setText(f"Data blokady: {blocking_date.strftime('%Y-%m-%d %H:%M')}")
+                    self.blocking_date_edit.setDateTime(QDateTime(blocking_date))
+
+                    # --- POCZĄTEK POPRAWKI ---
+                    # Zmień tekst przycisku, jeśli data istnieje
+                    self.save_blocking_date_button.setText("Zmień datę blokady")
+                    # --- KONIEC POPRAWKI ---
+
+            # 3. Pobranie statusu publikacji (bez zmian)
+            query_pub = f"SELECT TOP 1 Id FROM {SQL_OBJECTS['datypublikacjigrafiku']} WHERE Status=1 AND Rok=? AND Miesiac=?"
+            pub_status = cursor.execute(query_pub, (self.year, self.month)).fetchone()
+            self.publish_status_label.setText("Grafik: Opublikowany" if pub_status else "Grafik: Nieopublikowany")
+
+            conn.close()
+        except Exception as e:
+            self.suggestions_status_label.setText("Sugestie: Błąd odczytu")
+            self.publish_status_label.setText("Grafik: Błąd odczytu")
+            self.blocking_date_label.setText("Data blokady: Błąd odczytu")
+            # --- POCZĄTEK POPRAWKI ---
+            # Ustaw domyślny tekst nawet w przypadku błędu
+            if hasattr(self, 'save_blocking_date_button'):
+                self.save_blocking_date_button.setText("Ustaw datę blokady")
+            # --- KONIEC POPRAWKI ---
+            log_error(f"Nie udało się wczytać statusów: {e}", exception=e)
+            QMessageBox.warning(self, "Błąd", f"Nie udało się wczytać statusów: {e}")
+
+    def _save_blocking_date(self):
+        """Zapisuje lub aktualizuje datę i czas blokady PU w bazie danych."""
+        selected_datetime = self.blocking_date_edit.dateTime().toString("yyyy-MM-dd HH:mm")
+
+        reply = QMessageBox.question(self, "Potwierdzenie",
+                                     f"Czy na pewno chcesz ustawić datę i czas blokady planów urlopowych na {selected_datetime}?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+            sql = f"EXEC {SQL_OBJECTS['p_blokowaniesugestii']} ?, ?, ?, ?, ?, ?"
+            cursor.execute(sql, (self.year, self.month, selected_datetime, self.login_windows, None, 2))
+            conn.commit()
+            conn.close()
+
+            QMessageBox.information(self, "Sukces", "Data blokady planów urlopowych została zaktualizowana.")
+            self.load_initial_status()  # Ta metoda odświeży etykietę
+
+        except Exception as e:
+            log_error(f"Błąd zapisu daty blokady PU: {e}", exception=e)
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas zapisu daty blokady:<br>{e}")
+
+    def unlock_suggestions(self):
+        self._set_suggestions_status(0)
+
+    def lock_for_consultants(self):
+        self._set_suggestions_status(1)
+
+    def lock_for_support(self):
+        self._set_suggestions_status(2)
+
+    def _set_suggestions_status(self, status_code: int):
+        """
+        Zmienia status blokady sugestii w bazie danych, wywołując procedurę składowaną.
+        """
+        status_map = {
+            0: "Odblokowane",
+            1: "Zablokowane dla Konsultantów",
+            2: "Zablokowane dla Konsultantów i wsparcia"
+        }
+        status_name = status_map.get(status_code, "Nieznany")
+
+        reply = show_confirmation_dialog(
+            self, "Potwierdzenie zmiany statusu",
+            f"Czy na pewno chcesz zmienić status sugestii na:<br><b>{status_name}</b>?",
+            default_button=QMessageBox.No
+        )
+
+        if reply == QMessageBox.StandardButton.No:
+            return
+
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+            sql = f"EXEC {SQL_OBJECTS['p_blokowaniesugestii']} ?, ?, ?, ?, ?, ?"
+            cursor.execute(sql, (self.year, self.month, datetime.datetime.now(), self.login_windows, status_code, 1))
+            conn.commit()
+            conn.close()
+
+            QMessageBox.information(self, "Sukces", f"Status sugestii został pomyślnie zmieniony.")
+            self.load_initial_status()
+
+        except Exception as e:
+            log_error(f"Błąd podczas zmiany statusu sugestii na {status_code}: {e}", exception=e)
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas zmiany statusu sugestii:\<br>{e}")
+
+    def publish_schedule(self):
+        sql = f"exec {SQL_OBJECTS['p_publikowaniegrafiku']} {self.year}, {self.month}, '{self.login_windows}', 1"
+        if self._execute_procedure(sql):
+            QMessageBox.information(self, "Sukces", "Grafik został opublikowany.")
+            self.load_initial_status()
+            self.data_provider.clear_publish_status_cache(self.year, self.month)
+            self.data_refresh_needed.emit()
+
+    def unpublish_schedule(self):
+        sql = f"exec {SQL_OBJECTS['p_publikowaniegrafiku']} {self.year}, {self.month}, '{self.login_windows}', 0"
+        if self._execute_procedure(sql):
+            QMessageBox.information(self, "Sukces", "Publikacja grafiku została cofnięta.")
+            self.load_initial_status()
+            self.data_provider.clear_publish_status_cache(self.year, self.month)
+            self.data_refresh_needed.emit()
+
+    # --- NOWE METODY OBSŁUGI IMPORTU SUGESTII ---
+
+    def _start_suggestion_import(self):
+        """Rozpoczyna asynchroniczny import sugestii."""
+        if self.import_thread:
+            QMessageBox.warning(self, "Import w toku", "Import sugestii jest już uruchomiony.")
+            return
+
+        reply = show_confirmation_dialog(self, "Potwierdzenie",
+                                         "Czy na pewno chcesz pobrać sugestie Konsultantów? Może to spowodować nadpisanie istniejących danych w grafiku.",
+                                         default_button=QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        debug_print(f"Uruchamianie SuggestionImportThread dla {self.year}-{self.month}")
+
+        self.progress_dialog = QProgressDialog("Importowanie sugestii...", "Anuluj", 0, 0, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        self.import_thread = SuggestionImportThread(self.year, self.month)
+        self.import_thread.finished.connect(self._on_suggestion_import_finished)
+        self.import_thread.error_occurred.connect(self._on_suggestion_import_error)
+        self.progress_dialog.canceled.connect(self.import_thread.cancel)
+
+        self.import_thread.start()
+        self.progress_dialog.show()
+
+    def _on_suggestion_import_finished(self, success: bool, errors: list, headers: list):
+        """Callback po zakończeniu wątku importu sugestii."""
+        debug_print(f"SuggestionImportThread zakończony. Sukces: {success}, Błędów: {len(errors)}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.import_thread:
+            self.import_thread.deleteLater()
+            self.import_thread = None
+
+        if success:
+            # Zawsze emituj sygnał odświeżenia, aby zobaczyć zaimportowane dane
+            self.data_refresh_needed.emit()
+
+            if errors:
+                QMessageBox.warning(self, "Import zakończony z błędami",
+                                    f"Pomyślnie zakończono import, ale wystąpiło {len(errors)} błędów.\n"
+                                    "Szczegóły zostaną wyświetlone w nowym oknie.")
+                # Automatycznie pokaż okno błędów
+                self._show_error_dialog(errors, headers)
+            else:
+                QMessageBox.information(self, "Sukces", "Import sugestii zakończony pomyślnie. Nie znaleziono błędów.")
+
+    def _on_suggestion_import_error(self, error_message: str):
+        """Callback po krytycznym błędzie wątku."""
+        debug_print(f"SuggestionImportThread zgłosił błąd krytyczny: {error_message}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.import_thread:
+            self.import_thread.deleteLater()
+            self.import_thread = None
+
+        QMessageBox.critical(self, "Błąd krytyczny importu",
+                             f"Wystąpił błąd krytyczny podczas importu sugestii:\n{error_message}")
+
+    def _show_historical_logs(self):
+        """NOWA METODA: Pobiera i wyświetla historyczne logi """
+        debug_print(f"Pobieranie historycznych logów błędów dla {self.year}-{self.month}")
+        conn = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+
+            # Zapytanie do trwałej tabeli logów
+            sql = f"""
+                SELECT NrKadrowy, Uzytkownik, DataSugestii, Symbol, KomentarzBledu, DataLogu
+                FROM {SQL_OBJECTS['logsugestieimportin']}
+                WHERE Rok = ? AND Miesiac = ?
+                ORDER BY DataLogu DESC
+            """
+            cursor.execute(sql, (self.year, self.month))
+
+            errors = cursor.fetchall()
+            headers = [col[0] for col in cursor.description] if cursor.description else []
+
+            if not errors:
+                QMessageBox.information(self, "Brak logów",
+                                        f"Nie znaleziono zapisanych błędów importu dla {self.year}-{self.month}.")
+                return
+
+            # Wyświetl błędy w tym samym oknie dialogowym
+            self._show_error_dialog(errors, headers)
+
+        except Exception as e:
+            log_error(f"Błąd podczas pobierania historycznych logów: {e}", exception=e)
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Nie udało się pobrać logów błędów:<br>{e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _show_error_dialog(self, errors: list, headers: list):
+        """Tworzy lub aktywuje okno dialogowe z błędami."""
+        try:
+            # Jeśli okno już jest, po prostu je pokaż i aktywuj
+            if self.error_dialog:
+                self.error_dialog.activateWindow()
+                self.error_dialog.raise_()
+                # Możesz dodać logikę aktualizacji danych, jeśli to konieczne
+                # self.error_dialog.populate_table(errors)
+            else:
+                # Stwórz nowe okno
+                self.error_dialog = ErrorDisplayDialog(errors, headers, self.parent_widget)
+                self.error_dialog.finished.connect(self._on_error_dialog_closed)
+                self.error_dialog.set_current_theme(self.is_dark_theme)
+                self.error_dialog.show()
+        except Exception as e:
+            log_error(f"Nie można wyświetlić okna błędów: {e}", exception=e)
+
+    def _on_error_dialog_closed(self):
+        """Callback czyszczący referencję do okna błędów."""
+        debug_print("Okno błędów zostało zamknięte.")
+        self.error_dialog = None
+
+    # --- Metoda get_suggestions została zastąpiona przez _start_suggestion_import ---
+
+
+#
+# --- Początek klasy SuggestionsOutDialog (BEZ ZMIAN) ---
+#
+class SuggestionsOutDialog(QDialog):
+    """Dialog do pobierania sugestii i planów dla Lidera OUT."""
+    data_refresh_needed = Signal()
+
+    def __init__(self, parent, year, month):
+        super().__init__(None)
+        self.parent_widget = parent
+        self.year = year
+        self.month = month
+        self.is_dark_theme = getattr(parent, 'is_dark_theme', False)
+
+        self.setWindowFlags(
+            Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
+
+        user_app_id, _, _, _, login_windows = get_modifier_id()
+        self.user_app_id = user_app_id
+        self.login_windows = login_windows
+
+        self.setWindowTitle("Sugestie konsultantów out")
+
+        self.setup_ui()
+        self.connect_signals()
+        self.apply_styles()
+        self._load_groups()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        data_box = QGroupBox("Pobieranie danych")
+        data_layout = QVBoxLayout()
+        self.get_suggestions_button = QPushButton("Pobierz sugestie Konsultantów")
+        self.get_vacation_plans_button = QPushButton("Pobierz plany urlopowe")
+        data_layout.addWidget(self.get_suggestions_button)
+        data_layout.addWidget(self.get_vacation_plans_button)
+        data_box.setLayout(data_layout)
+
+        groups_box = QGroupBox("Wybierz grupy do pobrania:")
+        groups_layout = QVBoxLayout()
+        self.groups_list = QListWidget()
+        self.groups_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        groups_layout.addWidget(self.groups_list)
+        groups_box.setLayout(groups_layout)
+
+        layout.addWidget(data_box)
+        layout.addWidget(groups_box)
+
+        self.close_button = QPushButton("Zamknij")
+        close_button_layout = QHBoxLayout()
+        close_button_layout.addStretch()
+        close_button_layout.addWidget(self.close_button)
+        layout.addLayout(close_button_layout)
+
+    def connect_signals(self):
+        self.close_button.clicked.connect(self.accept)
+        self.get_suggestions_button.clicked.connect(self._get_consultant_suggestions)
+        self.get_vacation_plans_button.clicked.connect(self._get_vacation_plans)
+
+    def set_current_theme(self, is_dark_theme: bool):
+        """Publiczna metoda do odświeżania motywu na żywo."""
+        if self.is_dark_theme != is_dark_theme:
+            self.is_dark_theme = is_dark_theme
+            self.apply_styles()
+
+    def apply_styles(self):
+        theme = "dark" if self.is_dark_theme else "light"
+        self.setStyleSheet(AppStyles.get_dialog_style(theme))
+        for button in self.findChildren(QPushButton):
+            button.setStyleSheet(AppStyles.get_button_style(theme))
+        self.groups_list.setStyleSheet(AppStyles.get_list_style(theme))
+
+    def _get_selected_groups_str(self):
+        """Zwraca string z wybranymi grupami, gotowy do użycia w SQL."""
+        selected_items = [item.text() for item in self.groups_list.selectedItems()]
+        if not selected_items:
+            QMessageBox.warning(self, "Brak zaznaczenia", "Proszę wybrać co najmniej jedną grupę z listy.")
+            return None
+        return ",".join([f"'{item}'" for item in selected_items])
+
+    def _load_groups(self):
+        """Ładuje listę grup (przełożonych) na podstawie logiki VBA."""
+        self.groups_list.clear()
+        query = f"""
+            SELECT distinct PrzelozonyDane 
+            FROM {SQL_OBJECTS['konfiguracjazatrudnienie']}
+            """
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+            results = cursor.execute(query).fetchall()
+            conn.close()
+            for row in results:
+                self.groups_list.addItem(row[0])
+        except Exception as e:
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Nie udało się wczytać listy grup:<br>{e}")
+
+    def _get_consultant_suggestions(self):
+        """Adaptacja logiki VBA dla przycisku 'Pobierz sugestie Konsultantów'."""
+        selected_groups_str = self._get_selected_groups_str()
+        if not selected_groups_str: return
+
+        reply = show_confirmation_dialog(self, "Potwierdzenie",
+                                         "Czy na pewno chcesz pobrać sugestie? Może to spowodować nadpisanie wprowadzonych już danych.",
+                                         default_button=QMessageBox.No)
+
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            sql = f"EXEC {SQL_OBJECTS['p_pobieraniesugestiiout']} {self.year}, {self.month}, '{self.user_app_id}', {selected_groups_str}"
+            conn = DatabaseConnector.get_connection()
+            conn.execute(sql)
+            conn.commit()
+            conn.close()
+            QMessageBox.information(self, "Sukces", "Sugestie Konsultantów zostały pobrane do grafiku.")
+            self.data_refresh_needed.emit()
+        except Exception as e:
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas pobierania sugestii:<br>{e}")
+
+    def _get_vacation_plans(self):
+        """Adaptacja logiki VBA dla przycisku 'Pobierz plany urlopowe'."""
+        selected_groups_str = self._get_selected_groups_str()
+        if not selected_groups_str:
+            return
+
+        reply = show_confirmation_dialog(self, "Potwierdzenie",
+                                         "Czy na pewno chcesz pobrać plany urlopowe? Może to spowodować nadpisanie wprowadzonych już danych.",
+                                         default_button=QMessageBox.No)
+
+        if reply == QMessageBox.No:
+            return
+
+        try:
+            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, '{self.user_app_id}', {selected_groups_str}"
+            conn = DatabaseConnector.get_connection()
+            conn.execute(sql)
+            conn.commit()
+            conn.close()
+            QMessageBox.information(self, "Sukces", "Plany urlopowe zostały pobrane.")
+            self.data_refresh_needed.emit()
+        except Exception as e:
+            QMessageBox.critical(self, "Błąd Bazy Danych",
+                                 f"Wystąpił błąd podczas pobierania planów urlopowych:<br>{e}")

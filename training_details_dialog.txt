@@ -1,0 +1,297 @@
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QScrollArea, QWidget, 
+                               QFrame, QTableView, QHeaderView, QHBoxLayout, QPushButton, 
+                               QGraphicsDropShadowEffect, QGridLayout, QProgressBar)
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSize, Property, QParallelAnimationGroup, QPropertyAnimation
+from PySide6.QtGui import QColor, QFont, QCursor
+
+# --- LEVEL 3: MODEL DANYCH (KOSZYKI) ---
+class BucketTableModel(QAbstractTableModel):
+    """Model dla tabeli 'Koszyków' wewnątrz kategorii."""
+    def __init__(self, instances):
+        super().__init__()
+        # Sortowanie po dacie odwrotnie
+        self.instances = sorted(instances, key=lambda x: x.get('parsed_date'), reverse=True)
+        self.headers = ["Koszyk", "Data", "Godz", "Dni", "L4", "Akcje"]
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.instances)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        
+        inst = self.instances[index.row()]
+        col = index.column()
+        
+        if role == Qt.DisplayRole:
+            if col == 0: # Koszyk
+                # Wyświetlamy np. "Termin 1" albo nazwę z numerem
+                # Jeśli events grouped -> "Termin X (II sesja)" - tu improwizuję
+                base_name = inst.get('evt_name', 'Szkolenie')
+                return base_name
+            elif col == 1: # Data
+                d_start = inst.get('parsed_date')
+                d_end = inst.get('date_to')
+                if d_end and d_end != d_start:
+                    return f"{d_start} ➔ {d_end}"
+                return str(d_start)
+            elif col == 2: # Godz
+                # "12/24" - nie mam targetu, więc samo "12h"
+                return f"{inst.get('duration', 0.0):.1f}h"
+            elif col == 3: # Dni
+                return f"{inst.get('sub_events_count', 1)} dni"
+            elif col == 4: # L4
+                # Mockup logic, bo nie mam danych z L4 spiętych tutaj
+                return "-" 
+            elif col == 5: # Akcje
+                return "📋" # Tekstowa reprezentacja, delegat by to ładniej zrobił
+        
+        if role == Qt.TextAlignmentRole:
+            if col in [2, 3, 4, 5]:
+                return Qt.AlignCenter
+            return Qt.AlignLeft | Qt.AlignVCenter
+
+        return None
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return self.headers[section]
+        return None
+
+# --- LEVEL 2: KARTA KATEGORII (ACCORDION) ---
+class CategoryCard(QFrame):
+    def __init__(self, category_name, category_data, parent=None):
+        super().__init__(parent)
+        self.category_data = category_data
+        
+        self.setObjectName("CategoryCard")
+        self.setStyleSheet("""
+            QFrame#CategoryCard {
+                background-color: #2b2b2b;
+                border: 1px solid #3d3d3d;
+                border-radius: 8px;
+                margin-bottom: 10px;
+            }
+        """)
+        
+        # Shadows
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(15)
+        shadow.setColor(QColor(0, 0, 0, 100))
+        shadow.setOffset(0, 4)
+        self.setGraphicsEffect(shadow)
+
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
+
+        # 1. Header (Always visible)
+        self.header_frame = QFrame()
+        self.header_frame.setStyleSheet("background-color: transparent;")
+        self.setup_header(category_name, self.header_frame)
+        self.main_layout.addWidget(self.header_frame)
+
+        # 2. Content (Collapsible)
+        self.content_frame = QFrame()
+        self.content_frame.setStyleSheet("background-color: #232323; border-bottom-left-radius: 8px; border-bottom-right-radius: 8px;")
+        self.setup_content(category_data, self.content_frame)
+        
+        # Start collapsed logic (Using simple visibility toggle for simplicity)
+        self.content_frame.setVisible(False) 
+        self.main_layout.addWidget(self.content_frame)
+        
+        # Connect toggle
+        self.toggle_btn.clicked.connect(self.toggle_content)
+
+    def setup_header(self, name, container):
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Get Data
+        status = self.category_data.get('status', 'NIEZNANY')
+        progress_pct = self.category_data.get('progress_percent', 0.0)
+        target_h = self.category_data.get('target_hours', 1.0)
+        target_d = self.category_data.get('target_days', 1)
+        real_h = self.category_data.get('total_hours', 0.0)
+        real_d = self.category_data.get('real_days', 0)
+        full_name = self.category_data.get('full_name', name)
+        
+        # Row 1: Title and Expand Button
+        top_row = QHBoxLayout()
+        
+        # Determine Color based on status
+        status_color = "#95a5a6" # Grey default
+        if status == "UKOŃCZONA":
+            status_color = "#27ae60" # Green
+        elif status == "W TRAKCIE":
+            status_color = "#d35400" # Orange
+        elif status == "ZAPLANOWANA":
+            status_color = "#2980b9" # Blue
+            
+        # Badge
+        lbl_badge = QLabel(f"{name} | {full_name}")
+        lbl_badge.setStyleSheet(f"""
+            background-color: {status_color}; color: white; 
+            font-weight: bold; border-radius: 4px; padding: 4px 8px;
+        """)
+        top_row.addWidget(lbl_badge)
+        
+        top_row.addStretch()
+        
+        self.toggle_btn = QPushButton("▼ Rozwiń Koszyki")
+        self.toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.toggle_btn.setStyleSheet("""
+            QPushButton { border: none; color: #aaa; font-weight: bold; }
+            QPushButton:hover { color: #fff; }
+        """)
+        top_row.addWidget(self.toggle_btn)
+        
+        layout.addLayout(top_row)
+        
+        # Row 2: Status & Progress
+        status_row = QHBoxLayout()
+        lbl_status = QLabel(f"Status: {status}")
+        lbl_status.setStyleSheet(f"color: {status_color}; font-size: 12px; font-weight: bold;")
+        status_row.addWidget(lbl_status)
+        layout.addLayout(status_row)
+        
+        # Progress Bar
+        p_bar = QProgressBar()
+        p_bar.setFixedHeight(8)
+        p_bar.setRange(0, 100)
+        p_bar.setValue(int(progress_pct))
+        p_bar.setStyleSheet(f"""
+            QProgressBar {{ background-color: #444; border-radius: 4px; }}
+            QProgressBar::chunk {{ background-color: {status_color}; border-radius: 4px; }}
+        """)
+        p_bar.setTextVisible(False)
+        layout.addWidget(p_bar)
+
+        # Row 3: Metrics Grid (2x2)
+        grid_frame = QFrame()
+        grid_frame.setStyleSheet("background-color: transparent; margin-top: 10px;")
+        grid = QGridLayout(grid_frame)
+        grid.setContentsMargins(0, 0, 0, 0)
+        
+        # Metrics UI helper
+        def make_metric(label, value, progress_val, color):
+            w = QWidget()
+            l = QVBoxLayout(w)
+            l.setContentsMargins(0,0,0,0)
+            l.setSpacing(2)
+            l.addWidget(QLabel(label, styleSheet="color:#888; font-size:11px;"))
+            v_lbl = QLabel(value, styleSheet="color:#eee; font-weight:bold;")
+            l.addWidget(v_lbl)
+            pb = QProgressBar()
+            pb.setFixedHeight(4)
+            pb.setRange(0, 100)
+            pb.setValue(int(progress_val))
+            pb.setTextVisible(False)
+            pb.setStyleSheet(f"QProgressBar {{ background: #444; border-radius: 2px;}} QProgressBar::chunk {{ background: {color}; }}")
+            l.addWidget(pb)
+            return w
+
+        # Calculate partial percentages for metrics
+        pct_d = min((real_d / target_d) * 100, 100) if target_d > 0 else 0
+        pct_h = min((real_h / target_h) * 100, 100) if target_h > 0 else 0
+
+        grid.addWidget(make_metric(f"Dni: {real_d}/{target_d}", f"{real_d} dni", pct_d, status_color), 0, 0)
+        grid.addWidget(make_metric(f"Godzin: {real_h:.1f}/{target_h:.1f}", f"{real_h:.1f} h", pct_h, status_color), 0, 1)
+        
+        layout.addWidget(grid_frame)
+
+    def setup_content(self, data, container):
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Table
+        table = QTableView()
+        model = BucketTableModel(data.get('events', []))
+        table.setModel(model)
+        
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch) # Nazwa
+        table.setSelectionMode(QTableView.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet("""
+            QTableView { 
+                background-color: transparent; 
+                border: none; 
+                color: #ddd; 
+            }
+            QHeaderView::section {
+                background-color: #333;
+                color: #aaa;
+                border: none;
+                padding: 4px;
+            }
+            QTableView::item {
+                padding: 4px;
+            }
+        """)
+        
+        # Height
+        h = table.horizontalHeader().height() + (model.rowCount() * 30) + 10
+        table.setFixedHeight(min(h, 200))
+        
+        layout.addWidget(table)
+        
+        # Details link bottom
+        btn_details = QPushButton("Zobacz pełną historię i szczegóły ↗")
+        btn_details.setCursor(Qt.PointingHandCursor)
+        btn_details.setStyleSheet("background:none; border:none; color: #4a90e2; text-align:right;")
+        layout.addWidget(btn_details, 0, Qt.AlignRight)
+
+    def toggle_content(self):
+        is_visible = self.content_frame.isVisible()
+        self.content_frame.setVisible(not is_visible)
+        self.toggle_btn.setText("▲ Zwiń Koszyki" if not is_visible else "▼ Rozwiń Koszyki")
+
+
+class TrainingDetailsDialog(QDialog):
+    def __init__(self, user_name, user_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Szczegóły Szkoleń - Widok Agenta")
+        self.resize(550, 700)
+        self.setStyleSheet("background-color: #1e1e1e;")
+        
+        main_layout = QVBoxLayout(self)
+        
+        # Header Person
+        lbl_person = QLabel(f"👤 {user_name}")
+        lbl_person.setStyleSheet("font-size: 18px; font-weight: bold; color: #fff; margin-bottom: 5px;")
+        main_layout.addWidget(lbl_person)
+        
+        dept = user_data.get('department', 'Brak działu')
+        lbl_meta = QLabel(f"{dept} | Postęp Ogółem: (Mock 65%)")
+        lbl_meta.setStyleSheet("color: #aaa; margin-bottom: 20px;")
+        main_layout.addWidget(lbl_meta)
+
+        # Scroll
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+        
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        c_layout = QVBoxLayout(content)
+        c_layout.setSpacing(15)
+        
+        categories = user_data.get('categories', {})
+        for cat_name in sorted(categories.keys()):
+            card = CategoryCard(cat_name, categories[cat_name])
+            c_layout.addWidget(card)
+            
+        c_layout.addStretch()
+        scroll.setWidget(content)
+        main_layout.addWidget(scroll)
+        
+        btn_close = QPushButton("Zamknij")
+        btn_close.clicked.connect(self.accept)
+        btn_close.setStyleSheet("background:#333; color:white; padding:8px; border-radius:4px;")
+        main_layout.addWidget(btn_close)

@@ -1,0 +1,44 @@
+import configparser
+import os
+import sys
+from debug_utils import log_error
+from _version import __version__ as APP_VERSION
+# ### POCZĄTEK NOWEGO KODU ###
+def resource_path(relative_path):
+    """ Zwraca poprawną ścieżkę do zasobu, działa zarówno dla trybu developerskiego,
+        jak i dla spakowanej aplikacji PyInstaller. """
+    try:
+        # PyInstaller tworzy tymczasowy folder i przechowuje jego ścieżkę w _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+# ### KONIEC NOWEGO KODU ###
+
+
+# Utworzenie parsera i zdefiniowanie ścieżki do pliku
+config = configparser.ConfigParser()
+# ### ZMIANA: Użycie nowej funkcji do znalezienia ścieżki ###
+config_file_path = resource_path('config.ini')
+
+
+# Sprawdzenie, czy plik konfiguracyjny istnieje
+if not os.path.exists(config_file_path):
+    raise FileNotFoundError(f"Krytyczny błąd: Plik konfiguracyjny '{config_file_path}' nie został znaleziony. Aplikacja nie może zostać uruchomiona.")
+
+config.read(config_file_path, encoding='utf-8') # Dodano kodowanie dla pewności
+
+# Przygotowanie słownika DATABASE_CONFIG dla db_connector.py
+try:
+    DATABASE_CONFIG = dict(config.items('database'))
+except configparser.NoSectionError:
+    log_error("Błąd krytyczny: Sekcja [database] nie została znaleziona w pliku config.ini.")
+    DATABASE_CONFIG = {}
+
+# Przygotowanie słownika SQL_OBJECTS z nazwami obiektów bazy danych
+try:
+    SQL_OBJECTS = {key: value for key, value in config.items('sql_objects')}
+except configparser.NoSectionError:
+    log_error("Błąd krytyczny: Sekcja [sql_objects] nie została znaleziona w pliku config.ini.")
+    SQL_OBJECTS = {}

@@ -1,0 +1,191 @@
+from config import APP_VERSION
+import pyodbc
+from config import DATABASE_CONFIG
+import getpass
+from debug_utils import debug_print, log_warning, log_error
+from config import SQL_OBJECTS
+from app_settings import app_settings
+from contextlib import contextmanager
+
+
+class DatabaseConnector:
+    @staticmethod
+    def get_connection():
+        db_config = DATABASE_CONFIG
+        if db_config.get('engine') != 'mssql':
+            raise ValueError(f"Nieobsługiwany silnik bazy danych: {db_config.get('engine')}")
+
+        drivers_str = db_config.get('driver', '')
+        drivers = [d.strip() for d in drivers_str.split(',') if d.strip()]
+
+        if not drivers:
+            raise ValueError("Brak zdefiniowanych sterowników w pliku config.ini w sekcji [database] pod kluczem 'driver'.")
+
+        base_connection_string = (
+            f"SERVER={db_config.get('server')};"
+            f"DATABASE={db_config.get('database')};"
+        )
+        if db_config.get('trusted_connection', 'no').lower() == 'yes':
+            base_connection_string += "Trusted_Connection=yes;"
+        else:
+            user, password = db_config.get('user'), db_config.get('password')
+            if user and password:
+                base_connection_string += f"UID={user};PWD={password};"
+            else:
+                raise ValueError("Konfiguracja wymaga 'trusted_connection=yes' albo podania 'user' i 'password'.")
+
+        last_error = None
+        for driver in drivers:
+            try:
+                connection_string = f"DRIVER={{{driver}}};{base_connection_string}"
+                # debug_print(f"Próba połączenia ze sterownikiem: {driver}")
+                conn = pyodbc.connect(connection_string, timeout=5)
+                # debug_print(f"Połączenie udane przy użyciu sterownika: {driver}")
+                return conn
+            except pyodbc.Error as e:
+                last_error = e
+                log_warning(f"Nie udało się połączyć przy użyciu sterownika '{driver}': {e}")
+                continue
+
+        raise ConnectionError(f"Nie udało się nawiązać połączenia z bazą danych przy użyciu żadnego z podanych sterowników: {drivers_str}. Ostatni błąd: {last_error}")
+
+    @staticmethod
+    @contextmanager
+    def managed_connection():
+        """Menedżer kontekstu do bezpiecznego zarządzania połączeniami z bazą danych."""
+        conn = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            yield conn
+        except Exception as e:
+            log_error(f"Błąd w menedżerze kontekstu połączenia DB: {e}", exception=e)
+            raise  # Rzuć wyjątek dalej, aby operacja nadrzędna mogła go obsłużyć
+        finally:
+            if conn:
+                conn.close()
+
+
+def get_modifier_id(existing_conn=None):
+    """
+    Pobiera informacje o zalogowanym użytkowniku.
+    Może użyć istniejącego połączenia z bazą danych, aby uniknąć tworzenia nowego.
+    
+    Zwraca krotkę (id, nr_kadrowy, rola, wydzial, login).
+    Ignoruje flagę 'can_see_next_month', jeśli jest zwracana przez SQL.
+    """
+    username = getpass.getuser()
+    conn = None
+    try:
+        # Użyj istniejącego połączenia, jeśli zostało przekazane, w przeciwnym razie stwórz nowe.
+        if existing_conn:
+            conn = existing_conn
+        else:
+            conn = DatabaseConnector.get_connection()
+
+        cursor = conn.cursor()
+        query = f"SELECT * FROM {SQL_OBJECTS['fn_getuserappinfo']}(?)"
+        cursor.execute(query, (username,))
+        result = cursor.fetchone()
+
+        if result:
+            # SQL może zwracać 4 (nowy) lub 5 (stary) kolumn.
+            # Stara kolejność: ID, NrKadrowy, Rola, WidziNastepnyMiesiac, Wydzial
+            # Nowa kolejność (zakładana docelowo): ID, NrKadrowy, Rola, Wydzial
+            
+            # Bezpieczne mapowanie w zależności od liczby kolumn
+            if len(result) >= 5: # Stara wersja (z bool w środku)
+                 return result[0], result[1], result[2], result[4], username
+            elif len(result) == 4: # Nowa wersja
+                 return result[0], result[1], result[2], result[3], username
+            
+        # Fallback
+        return "System", username, "Użytkownik", None, username
+    except Exception as e:
+        log_error(f"Błąd podczas pobierania informacji o użytkowniku ({username}): {e}", exception=e)
+        return "System", username, "Użytkownik", None, username
+    finally:
+        # Zamknij połączenie tylko, jeśli zostało stworzone w tej funkcji
+        if not existing_conn and conn:
+            conn.close()
+
+
+def load_all_app_settings(existing_conn=None):
+    """
+    Ładuje wszystkie ustawienia z tabeli appsettings.
+    Może użyć istniejącego połączenia lub stworzyć własne.
+    """
+    conn = existing_conn
+    try:
+        # Jeśli nie przekazano istniejącego połączenia, stwórz nowe i zarządzaj nim
+        if not conn:
+            conn = DatabaseConnector.get_connection()
+
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT SettingKey, SettingValue FROM {SQL_OBJECTS['appsettings']}")
+        results = cursor.fetchall()
+
+        # Jeśli połączenie było stworzone tylko na potrzeby tej funkcji, zamknij je
+        if not existing_conn:
+            conn.close()
+
+        if not results:
+            log_error("Błąd krytyczny: Tabela [appsettings] jest pusta lub nie istnieje.")
+            return False
+
+        for row in results:
+            if row.SettingKey and row.SettingValue:
+                app_settings.parse_and_apply(row.SettingKey, row.SettingValue)
+        # Nie logujemy tutaj sukcesu, aby uniknąć zaśmiecania logów co minutę
+        return True
+    except Exception as e:
+        # Jeśli połączenie było stworzone tutaj i wystąpił błąd, spróbuj je zamknąć
+        if not existing_conn and conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        log_error(f"Błąd krytyczny podczas ładowania ustawień aplikacji: {e}", exception=e)
+        return False
+
+
+def save_app_setting(key: str, value: str, existing_conn=None) -> bool:
+    """
+    Zapisuje lub aktualizuje globalne ustawienie w tabeli appsettings.
+    Używa MERGE (lub logiki UPDATE/INSERT) w zależności od silnika DB (zakładamy MSSQL).
+    """
+    conn = existing_conn
+    try:
+        if not conn:
+            conn = DatabaseConnector.get_connection()
+
+        cursor = conn.cursor()
+        table_name = SQL_OBJECTS['appsettings']
+        
+        # Zapytanie typu UPSERT dla MSSQL
+        # Używamy MERGE dla atomowości, lub sprawdzenia IF EXISTS
+        query = f"""
+            MERGE {table_name} AS target
+            USING (SELECT ? AS SettingKey, ? AS SettingValue) AS source
+            ON (target.SettingKey = source.SettingKey)
+            WHEN MATCHED THEN
+                UPDATE SET SettingValue = source.SettingValue
+            WHEN NOT MATCHED THEN
+                INSERT (SettingKey, SettingValue) VALUES (source.SettingKey, source.SettingValue);
+        """
+        
+        cursor.execute(query, (key, value))
+        
+        if not existing_conn:
+            conn.commit()
+            conn.close()
+            
+        return True
+    except Exception as e:
+        if not existing_conn and conn:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+        log_error(f"Błąd podczas zapisywania ustawienia globalnego '{key}': {e}", exception=e)
+        return False

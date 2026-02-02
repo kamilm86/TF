@@ -1,0 +1,52 @@
+"""
+Konfiguracja celów szkoleniowych.
+Definiuje wymagania (czas, dni) dla poszczególnych kategorii (hashtagów).
+"""
+
+class TrainingConfig:
+    # Domyślne cele dla nieznanych kategorii
+    DEFAULT_TARGET = {
+        "hours": 8.0,
+        "days": 1,
+        "name": "Szkolenie"
+    }
+
+    # Cele szczegółowe dla tagów
+    # Klucz: Tag (wielkimi literami, bez #)
+    TARGETS = {
+        "WSTĘPNE": {
+            "hours": 24.0,
+            "days": 4,
+            "name": "Szkolenie Wstępne"
+        },
+        "PRE1": {
+            "hours": 8.0,
+            "days": 1,
+            "name": "Przygotowanie PRE1"
+        },
+        "BHP": {
+            "hours": 4.0,
+            "days": 1,
+            "name": "BHP Stanowiskowe"
+        },
+        "RODO": {
+            "hours": 2.0,
+            "days": 1,
+            "name": "Ochrona Danych"
+        },
+        "ZAAWANSOWANE": {
+            "hours": 40.0,
+            "days": 5,
+            "name": "Szkolenie Zaawansowane"
+        },
+        "PRAKTYKA": {
+            "hours": 160.0,
+            "days": 20,
+            "name": "Praktyki Zawodowe"
+        }
+    }
+
+    @classmethod
+    def get_target(cls, tag: str):
+        """Pobiera konfigurację dla danego taga."""
+        return cls.TARGETS.get(tag.upper(), cls.DEFAULT_TARGET)

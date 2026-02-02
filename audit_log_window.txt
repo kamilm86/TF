@@ -1,0 +1,148 @@
+# audit_log_window.py
+
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableView, QLabel,
+                               QHeaderView, QPushButton, QSpacerItem, QSizePolicy)
+# ZMIANA: Dodano import dla QSortFilterProxyModel
+from PySide6.QtCore import Qt, QAbstractTableModel, QModelIndex, Signal, QSortFilterProxyModel
+from PySide6.QtGui import QColor, QBrush
+from styles import AppStyles
+import datetime
+
+
+class AuditLogTableModel(QAbstractTableModel):
+    """Model danych dla tabeli z historią zmian."""
+
+    def __init__(self, data=None, parent=None):
+        super().__init__(parent)
+        self._data = data or []
+        self._headers = ["Data Zmiany", "Pracownik", "Symbol po zmianie", "Typ modyfikacji", "Zmodyfikowano o",
+                         "Zmodyfikował"]
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._data)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self._headers)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self._headers[section]
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+
+        row_data = self._data[index.row()]
+        col = index.column()
+
+        if role == Qt.DisplayRole:
+            if col == 0:
+                val = row_data.get('Data')
+                return val.strftime('%Y-%m-%d') if isinstance(val, datetime.date) else ''
+            elif col == 1:
+                return str(row_data.get('UzytkownikDane', ''))  # Poprawka na UzytkownikDane dla spójności
+            elif col == 2:
+                return row_data.get('Symbol', '')
+            elif col == 3:
+                return row_data.get('TypModyfikacji', '')
+            elif col == 4:
+                val = row_data.get('DataModyfikacji')
+                return val.strftime('%Y-%m-%d %H:%M:%S') if isinstance(val, datetime.datetime) else ''
+            elif col == 5:
+                return row_data.get('Modyfikujacy', '')
+
+        if role == Qt.ForegroundRole and col == 3:
+            op_type = row_data.get('TypModyfikacji', '')
+            if op_type == 'Wstawienie symbolu':
+                return QBrush(QColor("lightgreen"))
+            elif op_type == 'Usunięcie symbolu':
+                return QBrush(QColor("red"))
+            elif op_type == 'UPDATE':
+                return QBrush(QColor("orange"))
+
+        return None
+
+    def update_data(self, new_data):
+        """Metoda do aktualizacji danych w modelu."""
+        self.beginResetModel()
+        self._data = new_data
+        self.endResetModel()
+
+
+class AuditLogWindow(QDialog):
+    """Okno do wyświetlania historii zmian w grafiku z sortowaniem i płynnym skalowaniem."""
+
+    refresh_requested = Signal()
+
+    def __init__(self, audit_data, is_dark_theme, parent=None, is_limited_view=False, year=None, month=None, limit=50):
+        super().__init__(parent)
+        self.setWindowTitle("Historia Zmian Grafiku")
+        self.setMinimumSize(1000, 500)  # Zwiększono domyślny rozmiar dla lepszej czytelności
+
+        main_layout = QVBoxLayout(self)
+        # Dodajemy etykietę informacyjną na górze okna
+        self.info_label = QLabel()
+        self.info_label.setStyleSheet("font-style: italic; color: gray; margin-bottom: 5px;")
+        main_layout.addWidget(self.info_label)
+
+        # Ustawiamy tekst i widoczność etykiety w zależności od trybu
+        if is_limited_view:
+            self.info_label.setText(
+                f"Wyświetlono ostatnich {limit} zmian dla {month:02}/{year}, ponieważ nie zaznaczono żadnych komórek.")
+            self.info_label.setVisible(True)
+        else:
+            self.info_label.setVisible(False)
+        # --- KONIEC NOWEGO KODU ---
+        self.audit_table_view = QTableView()
+        main_layout.addWidget(self.audit_table_view)
+
+        button_layout = QHBoxLayout()
+        button_layout.addSpacerItem(QSpacerItem(40, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        self.refresh_button = QPushButton("Odśwież")
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
+        self.close_button = QPushButton("Zamknij")
+        self.close_button.clicked.connect(self.accept)
+        button_layout.addWidget(self.refresh_button)
+        button_layout.addWidget(self.close_button)
+        main_layout.addLayout(button_layout)
+
+        # --- NOWA LOGIKA: Użycie QSortFilterProxyModel do sortowania ---
+        # 1. Tworzymy nasz główny model danych (źródło)
+        self.source_model = AuditLogTableModel(audit_data)
+
+        # 2. Tworzymy model proxy, który będzie zarządzał sortowaniem
+        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model.setSourceModel(self.source_model)
+
+        # 3. Ustawiamy model PROXY w tabeli, a nie model źródłowy
+        self.audit_table_view.setModel(self.proxy_model)
+
+        # 4. Włączamy sortowanie w widoku tabeli
+        self.audit_table_view.setSortingEnabled(True)
+        # --- KONIEC NOWEJ LOGIKI ---
+
+        # Ustawianie stylu i rozmiarów
+        theme = "dark" if is_dark_theme else "light"
+        self.setStyleSheet(AppStyles.get_dialog_style(theme))
+        self.audit_table_view.setStyleSheet(AppStyles.get_table_style(theme))
+        self.refresh_button.setStyleSheet(AppStyles.get_button_style(theme))
+        self.close_button.setStyleSheet(AppStyles.get_button_style(theme))
+
+        # --- ZMIANA: Poprawka wydajności skalowania okna ---
+        # Ustawiamy tryb interaktywny, który jest szybki i pozwala użytkownikowi zmieniać rozmiar
+        self.audit_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        # Jednorazowo dopasowujemy kolumny do zawartości po załadowaniu danych
+        self.audit_table_view.resizeColumnsToContents()
+        self.audit_table_view.horizontalHeader().setStretchLastSection(True)
+        # --- KONIEC ZMIANY ---
+
+        # Ustawiamy domyślne sortowanie po dacie modyfikacji (kolumna 4) malejąco
+        self.audit_table_view.sortByColumn(4, Qt.DescendingOrder)
+
+    def update_model_data(self, new_data):
+        """Publiczna metoda do aktualizacji danych w tabeli."""
+        # ZMIANA: Aktualizujemy model źródłowy, a proxy zajmie się resztą
+        self.source_model.update_data(new_data)
+        # Dopasowujemy kolumny na nowo po aktualizacji danych
+        self.audit_table_view.resizeColumnsToContents()

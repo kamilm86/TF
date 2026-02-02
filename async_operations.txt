@@ -1,0 +1,427 @@
+# async_operations.py
+
+from PySide6.QtCore import QThread, Signal, Qt
+from PySide6.QtWidgets import QProgressDialog, QMessageBox, QApplication
+from db_connector import DatabaseConnector, SQL_OBJECTS, get_modifier_id, load_all_app_settings
+from app_settings import app_settings
+from config import APP_VERSION
+from debug_utils import log_error, debug_print, log_warning
+import pyodbc
+
+
+class SuggestionImportThread(QThread):
+    """
+    Wątek roboczy do asynchronicznego importowania sugestii
+    z procedury p_pobierzsugestiein i przechwytywania logów błędów.
+    """
+    # Sygnał emitowany po zakończeniu: sukces (bool), lista błędów (list), nagłówki (list)
+    finished = Signal(bool, list, list)
+    # Sygnał emitowany przy błędzie krytycznym samego wątku
+    error_occurred = Signal(str)
+
+    def __init__(self, year, month, parent=None):
+        super().__init__(parent)
+        self.year = year
+        self.month = month
+        self._is_cancelled = False
+
+    def run(self):
+        conn = None
+        cursor = None  # <-- Zadeklaruj kursor na zewnątrz, aby był dostępny w 'finally'
+        try:
+            conn = DatabaseConnector.get_connection()
+
+            conn.autocommit = True
+            conn.timeout = 0  # Bez limitu czasu
+            debug_print(f"Ustawiono conn.timeout = 0 (bez limitu) dla SuggestionImportThread.")
+
+            cursor = conn.cursor()  # <-- Przypisz do zmiennej
+
+            data_str = f"{self.year}-{self.month:02d}-01"
+
+            # Zakładamy, że 3 oznacza "WSZYSCY"
+            params = (self.year, self.month, data_str, 3)
+
+            sql = f"EXEC {SQL_OBJECTS['p_pobierzsugestiein']} ?, ?, ?, ?"
+
+            debug_print(
+                f"Wywołuję SuggestionImportThread: EXEC {SQL_OBJECTS['p_pobierzsugestiein']} @Rok={params[0]}, @Miesiac={params[1]}, @Data={params[2]}, @FiltrGrup={params[3]}")
+
+            cursor.execute(sql, params)
+
+            errors = cursor.fetchall()
+            headers = [col[0] for col in cursor.description] if cursor.description else []
+
+            if not self._is_cancelled:
+                self.finished.emit(True, errors, headers)
+
+        except pyodbc.Error as e:
+            if "Operation canceled" in str(e) or self._is_cancelled:
+                log_warning(f"Import sugestii anulowany przez użytkownika.")
+                self.finished.emit(False, [], [])
+            else:
+                log_error(f"Błąd SQL w SuggestionImportThread: {e}", exception=e)
+                if not self._is_cancelled:
+                    self.error_occurred.emit(f"Błąd bazy danych: {e}")
+        except Exception as e:
+            log_error(f"Krytyczny błąd w SuggestionImportThread: {e}", exception=e)
+            if not self._is_cancelled:
+                self.error_occurred.emit(f"Błąd aplikacji: {e}")
+        finally:
+            # --- POCZĄTEK KLUCZOWEJ POPRAWKI ---
+            # Musimy zamknąć kursor PRZED zmianą ustawień połączenia.
+            if cursor:
+                cursor.close()
+                debug_print("Zamknięto kursor bazy danych.")
+            # --- KONIEC KLUCZOWEJ POPRAWKI ---
+
+
+            if conn:
+                # Teraz te polecenia powinny wykonać się poprawnie
+                conn.autocommit = False
+                conn.timeout = 30
+                conn.close()
+                debug_print("Przywrócono domyślny stan połączenia (autocommit=False, timeout=30).")
+    def cancel(self):
+        """Metoda do anulowania operacji."""
+        self._is_cancelled = True
+        debug_print("Otrzymano żądanie anulowania importu sugestii.")
+
+class LocationExceptionThread(QThread):
+    """Wątek roboczy do zarządzania wyjątkami lokalizacyjnymi w tle."""
+    progress_updated = Signal(int)
+    finished = Signal(bool, list)  # Sygnał: sukces, lista błędów
+    error_occurred = Signal(str)
+
+    def __init__(self, operations: list, parent=None):
+        super().__init__(parent)
+        self.operations = operations
+        self._is_cancelled = False
+
+    def run(self):
+        conn = None
+        errors = []
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+            query = f"EXEC {SQL_OBJECTS['p_lokalizacjewyjatki']} ?, ?, ?, ?, ?, ?, ?, ?"
+
+            for i, params in enumerate(self.operations):
+                if self._is_cancelled:
+                    break
+                try:
+                    cursor.execute(query, params)
+                    while cursor.nextset():
+                        pass
+                except Exception as e:
+                    date_str = params[2] if len(params) > 2 else "N/A"
+                    errors.append(f"Dzień {date_str}: {e}")
+                self.progress_updated.emit(i + 1)
+
+            if not self._is_cancelled:
+                conn.commit()
+
+            self.finished.emit(not errors, errors)
+
+        except Exception as e:
+            log_error(f"Krytyczny błąd w wątku wyjątków lokalizacyjnych: {e}", exception=e)
+            self.error_occurred.emit(str(e))
+        finally:
+            if conn:
+                conn.close()
+
+    def cancel(self):
+        self._is_cancelled = True
+
+class CancelDelegationsThread(QThread):
+    """Wątek roboczy do odwoływania delegacji w tle."""
+    progress_updated = Signal(int)
+    finished = Signal(int, list)  # Zwraca liczbę odwołanych i listę par (user_id, date_key)
+    error_occurred = Signal(str)
+
+    def __init__(self, events_to_cancel, parent=None):
+        super().__init__(parent)
+        self.events_to_cancel = events_to_cancel
+        self._is_cancelled = False
+
+    def run(self):
+        successful_updates = 0
+        affected_user_date_pairs = set()
+        conn = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+            modyfikujacy_id, _, _, _, _ = get_modifier_id()
+            total = len(self.events_to_cancel)
+
+            for i, event in enumerate(self.events_to_cancel):
+                if self._is_cancelled:
+                    break
+
+                event_id, event_type = event.get('id'), event.get('type')
+                if not all([event_id, event_type]): continue
+
+                table_name = ""
+                if event_type == "Spotkanie": table_name = SQL_OBJECTS['spotkania']
+                elif event_type == "Szkolenie": table_name = SQL_OBJECTS['szkolenia']
+                elif event_type == "Nadgodziny": table_name = SQL_OBJECTS['nadgodziny']
+                if not table_name: continue
+
+                try:
+                    if event_type in ["Spotkanie", "Szkolenie"]:
+                        query = f"UPDATE {table_name} SET Status = 0, DataDo = NULL, DataOd = Data, Modyfikujacy = ? WHERE Id = ?"
+                        cursor.execute(query, (modyfikujacy_id, event_id))
+                    else:
+                        query = f"DELETE FROM {table_name} WHERE Id = ?"
+                        cursor.execute(query, (event_id,))
+
+                    if cursor.rowcount > 0:
+                        successful_updates += 1
+                        affected_user_date_pairs.add((event.get('user_id'), event.get('date_key')))
+                        debug_print(f"[CancelDelegationsThread] Zaktualizowano zdarzenie ID={event_id} Typ={event_type}")
+                    else:
+                        debug_print(f"[CancelDelegationsThread] OSTRZEŻENIE: Brak aktualizacji dla ID={event_id} (rowcount=0)")
+
+                except Exception as db_err:
+                    log_error(f"Błąd DB podczas odwoływania {event_type} ID {event_id}: {db_err}", exception=db_err)
+                self.progress_updated.emit(i + 1)
+
+            if not self._is_cancelled and successful_updates > 0:
+                conn.commit()
+
+            self.finished.emit(successful_updates, list(affected_user_date_pairs))
+        except Exception as e:
+            log_error(f"Krytyczny błąd w wątku odwoływania delegacji: {e}", exception=e)
+            self.error_occurred.emit(str(e))
+        finally:
+            if conn: conn.close()
+
+    def cancel(self):
+        self._is_cancelled = True
+
+class DelegationCanceler:
+    """Klasa zarządzająca procesem odwoływania delegacji w tle."""
+
+    def __init__(self, parent_window):
+        self.parent = parent_window
+        self.thread = None
+        self._saved_view_state = None
+        self._on_success_callback = None
+        self._silent_mode = False
+
+    def start_cancellation(self, events_to_cancel: list, on_success: callable = None, silent: bool = False):
+        if not events_to_cancel:
+            if on_success:
+                on_success()
+            return
+
+        # Zapisz parametry
+        self._on_success_callback = on_success
+        self._silent_mode = silent
+
+        self.progress_dialog = QProgressDialog("Odwoływanie delegacji...", "Anuluj", 0, len(events_to_cancel),
+                                               self.parent)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        # Zapisz stan widoku PRZED startem wątku (bo to wątek główny)
+        if hasattr(self.parent, '_save_view_state'):
+            self._saved_view_state = self.parent._save_view_state()
+
+        self.thread = CancelDelegationsThread(events_to_cancel)
+        self.thread.progress_updated.connect(self.progress_dialog.setValue)
+        self.thread.finished.connect(self._on_finished)
+        self.thread.error_occurred.connect(self._on_error)
+        self.progress_dialog.canceled.connect(self.thread.cancel)
+
+        self.thread.start()
+        # Używamy open(), żeby nie blokować event loop (async)
+        self.progress_dialog.open()
+
+    def _on_finished(self, canceled_count, affected_user_date_pairs):
+        self.progress_dialog.close()
+
+        if canceled_count > 0:
+            if not self._silent_mode:
+                self.parent.statusBar().showMessage(f"Pomyślnie odwołano {canceled_count} zdarzeń.", 5000)
+            
+            self.parent._update_modification_date()
+
+            if affected_user_date_pairs:
+                # 1. Invalidate cache (czyści stare dane w DataProvider)
+                self.parent.data_provider.invalidate_complete_cache_for_pairs(affected_user_date_pairs)
+
+                # 2. KLUCZOWA POPRAWKA: Zaktualizuj liczniki ikon w modelu grafiku
+                # - Uaktualniamy day_data['spotkania'], day_data['szkolenia'], day_data['nadgodziny']
+                # - bo to te wartości są odczytywane przez _get_dynamic_meeting_icon / _get_dynamic_overtime_icon
+                if hasattr(self.parent, 'schedule_model'):
+                    model = self.parent.schedule_model
+                    for user_id, date_str in affected_user_date_pairs:
+                        try:
+                            # Znajdź wiersz użytkownika
+                            for key in model._keys:
+                                if str(key[3]) == str(user_id):
+                                    row_data = model._processed_data.get(key, {})
+                                    
+                                    # Wyciągnij dzień z daty
+                                    day = int(date_str.split('-')[2])
+                                    day_data = row_data.get('days', {}).get(day, {})
+                                    
+                                    if day_data:
+                                        # Pobierz aktualne zdarzenia z odświeżonego cache DataProvider
+                                        fresh_events = self.parent.data_provider.get_events_for_user_date(
+                                            user_id, date_str, active_only=True
+                                        )
+                                        
+                                        # Zlicz typy zdarzeń - TYLKO ze statusem 'Delegowany' dla ikon spotkań/szkoleń
+                                        # Status 'Do delegacji' oznacza odwołane - NIE pokazuje ikony
+                                        meetings_count = sum(1 for e in fresh_events 
+                                            if e.get('type') == 'Spotkanie' and e.get('status') == 'Delegowany')
+                                        trainings_count = sum(1 for e in fresh_events 
+                                            if e.get('type') == 'Szkolenie' and e.get('status') == 'Delegowany')
+                                        # Nadgodziny - zliczaj wszystkie aktywne (nie tylko 'Delegowany')
+                                        overtime_count = sum(1 for e in fresh_events if e.get('type') == 'Nadgodziny')
+                                        
+                                        # Aktualizuj liczniki w danych modelu
+                                        day_data['spotkania'] = meetings_count
+                                        day_data['szkolenia'] = trainings_count
+                                        day_data['nadgodziny'] = overtime_count
+                                        
+                                        debug_print(
+                                            f"DelegationCanceler: Zaktualizowano liczniki dla ({user_id}, {date_str}): "
+                                            f"S={meetings_count}, T={trainings_count}, N={overtime_count}"
+                                        )
+                                    break
+                        except Exception as e:
+                            debug_print(f"DelegationCanceler: Błąd aktualizacji liczników: {e}")
+                    
+                    # 3. Wyemituj sygnał dataChanged dla zmienionych komórek
+                    model.refresh_specific_icons(affected_user_date_pairs)
+
+                # 4. Wymuś przerysowanie głównej tabeli
+                self.parent.table.schedule_view.viewport().update()
+
+                # 5. Przywróć zaznaczenie (żeby komórka nadal była "niebieska")
+                if self._saved_view_state:
+                    self.parent._restore_view_state(self._saved_view_state)
+                    self._saved_view_state = None
+
+                # 6. Wymuś odświeżenie tabeli zdarzeń (dolnej)
+                self.parent.on_selection_changed()
+        else:
+            if not self._silent_mode:
+                 QMessageBox.warning(self.parent, "Brak zmian", "Nie udało się odwołać żadnej delegacji.")
+
+        # Wywołaj callback sukcesu (jeśli zdefiniowany) - nawet jeśli count=0, bo proces się zakończył
+        if self._on_success_callback:
+            try:
+                self._on_success_callback(canceled_count, affected_user_date_pairs)
+            except Exception as e:
+                log_error(f"DelegationCanceler: Błąd callback: {e}")
+
+        self._on_success_callback = None
+        self._silent_mode = False
+        self.thread = None
+
+    def _on_error(self, error_message):
+        self.progress_dialog.close()
+        QMessageBox.critical(self.parent, "Błąd krytyczny",
+                             f"Wystąpił błąd podczas odwoływania delegacji:\n{error_message}")
+        self.thread = None
+        self._on_success_callback = None
+
+
+class LocationExceptionManager:
+    """Klasa zarządzająca operacjami na wyjątkach lokalizacyjnych w tle."""
+
+    def __init__(self, parent_window):
+        self.parent = parent_window
+        self.thread = None
+        self.on_finish_callback = None
+
+    def start_operations(self, operations: list, on_finish: callable = None):
+        if not operations:
+            return
+
+        self.on_finish_callback = on_finish
+
+        self.progress_dialog = QProgressDialog("Przetwarzanie wyjątków...", "Anuluj", 0, len(operations),
+                                               self.parent)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        self.thread = LocationExceptionThread(operations)
+        self.thread.progress_updated.connect(self.progress_dialog.setValue)
+        self.thread.finished.connect(self._on_finished)
+        self.thread.error_occurred.connect(self._on_error)
+        self.progress_dialog.canceled.connect(self.thread.cancel)
+
+        self.thread.start()
+        self.progress_dialog.open()
+
+    def _on_finished(self, success, errors):
+        self.progress_dialog.close()
+
+        if errors:
+            QMessageBox.warning(self.parent, "Wystąpiły błędy",
+                                "Nie wszystkie operacje zakończyły się sukcesem:\n\n" + "\n".join(errors))
+
+        if self.on_finish_callback:
+            self.on_finish_callback()
+
+        self.thread = None
+        self.on_finish_callback = None
+
+    def _on_error(self, error_message):
+        self.progress_dialog.close()
+        QMessageBox.critical(self.parent, "Błąd krytyczny",
+                             f"Wystąpił błąd podczas przetwarzania wyjątków:\n{error_message}")
+        self.thread = None
+
+
+class BackgroundCheckerThread(QThread):
+    """
+    Wątek do sprawdzania w tle nowej wersji aplikacji i nowych danych w grafiku,
+    bez blokowania głównego wątku UI.
+    """
+    update_required = Signal(bool, bool)  # force_update, version_obsolete
+    permissions_changed = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_user_role = QApplication.instance().sender().current_user_app_role if QApplication.instance().sender() else None
+
+    def run(self):
+        conn = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            if not conn:
+                self.error_occurred.emit("Nie można nawiązać połączenia z bazą danych.")
+                return
+
+            # 1. Załaduj najnowsze ustawienia aplikacji
+            # --- ZMIANA: Nie ładujemy już wszystkich ustawień, tylko sprawdzamy wersję ---
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT SettingValue FROM {SQL_OBJECTS['appsettings']} WHERE SettingKey = 'current_version'")
+            version_row = cursor.fetchone()
+            cursor.execute(f"SELECT SettingValue FROM {SQL_OBJECTS['appsettings']} WHERE SettingKey = 'force_update'")
+            force_update_row = cursor.fetchone()
+
+            # 2. Sprawdź, czy wymagana jest aktualizacja
+            from packaging.version import parse as parse_version
+            is_update_forced = force_update_row[0].lower() == 'true' if force_update_row else False
+            required_version = version_row[0] if version_row else APP_VERSION
+            is_version_obsolete = parse_version(APP_VERSION) != parse_version(required_version)
+
+            if is_update_forced or is_version_obsolete:
+                self.update_required.emit(is_update_forced, is_version_obsolete)
+                return  # Zakończ wątek, aplikacja i tak zostanie zamknięta
+
+        except Exception as e:
+            log_error(f"Błąd w wątku BackgroundCheckerThread: {e}", exception=e)
+            self.error_occurred.emit(str(e))
+
+        finally:
+            if conn:
+                conn.close()
