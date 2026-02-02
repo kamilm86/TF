@@ -20,6 +20,7 @@ class AppSettings:
         self.LOGGING_USERS_CONSOLE = set()
         self.SUPER_LIDER_LOGINS = set()
         self.ENABLE_NOTIFICATION_CENTER = True
+        self.SCHEDULE_CONTROL_ALL_MONTHS = False  # False = tylko nowy miesiąc, True = wszystkie miesiące
         self.HISTORY_MONTHS = 3  # Domyślna liczba miesięcy wstecz w grafiku
         
         # Domyślne cele szkoleniowe (fallback przed załadowaniem z bazy lub jeśli brak w bazie)
@@ -68,6 +69,11 @@ class AppSettings:
                 from debug_utils import debug_print
                 debug_print(
                     f"AppSettings: Centrum Powiadomień jest {'WŁĄCZONE' if self.ENABLE_NOTIFICATION_CENTER else 'WYŁĄCZONE'}")
+            elif key == 'ScheduleControlAllMonths':
+                self.SCHEDULE_CONTROL_ALL_MONTHS = value.lower() == 'true'
+                from debug_utils import debug_print
+                debug_print(
+                    f"AppSettings: Zarządzaj Grafikiem dla {'WSZYSTKICH miesięcy' if self.SCHEDULE_CONTROL_ALL_MONTHS else 'tylko nowego miesiąca'}")
             elif key == 'SymbolPermissions':
                 self.SYMBOL_PERMISSIONS = json.loads(value)
                 # Używamy debug_print z modułu debug_utils

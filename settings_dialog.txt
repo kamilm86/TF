@@ -410,20 +410,28 @@ class AppSettingsDialog(QDialog):
         self.global_notification_check.setChecked(app_settings.ENABLE_NOTIFICATION_CENTER)
         layout.addWidget(self.global_notification_check, 0, 0, 1, 2)
         
-        # 2. Historia Grafiku
-        layout.addWidget(QLabel("Liczba miesięcy wstecz w grafiku:"), 1, 0)
+        # 2. Zarządzaj Grafikiem - widoczność dla wszystkich miesięcy
+        self.schedule_control_all_months_check = QCheckBox("Pokaż \"Zarządzaj Grafikiem\" dla wszystkich miesięcy")
+        self.schedule_control_all_months_check.setChecked(app_settings.SCHEDULE_CONTROL_ALL_MONTHS)
+        self.schedule_control_all_months_check.setToolTip(
+            "Domyślnie przycisk jest widoczny tylko dla następnego miesiąca.\n"
+            "Zaznacz, aby przycisk był widoczny dla wszystkich miesięcy.")
+        layout.addWidget(self.schedule_control_all_months_check, 1, 0, 1, 2)
+        
+        # 3. Historia Grafiku
+        layout.addWidget(QLabel("Liczba miesięcy wstecz w grafiku:"), 2, 0)
         self.history_months_spin = QSpinBox()
         self.history_months_spin.setRange(1, 24)
         self.history_months_spin.setSuffix(" mies.")
         self.history_months_spin.setValue(getattr(app_settings, 'HISTORY_MONTHS', 3))
         self.history_months_spin.setToolTip("Określa ile miesięcy wstecz jest widocznych na liście wyboru daty.")
-        layout.addWidget(self.history_months_spin, 1, 1)
+        layout.addWidget(self.history_months_spin, 2, 1)
 
-        layout.addWidget(QLabel("<i>Zmiana tych ustawień wpłynie na wszystkich użytkowników aplikacji.</i>"), 2, 0, 1, 2)
+        layout.addWidget(QLabel("<i>Zmiana tych ustawień wpłynie na wszystkich użytkowników aplikacji.</i>"), 3, 0, 1, 2)
         
         self.edit_permissions_btn = QPushButton("Edytuj Uprawnienia Ról")
         self.edit_permissions_btn.clicked.connect(self.open_permissions_editor)
-        layout.addWidget(self.edit_permissions_btn, 3, 0, 1, 2)
+        layout.addWidget(self.edit_permissions_btn, 4, 0, 1, 2)
         
         group.setLayout(layout)
         return group
@@ -458,6 +466,15 @@ class AppSettingsDialog(QDialog):
                 self.save_global_settings_requested.emit({
                     "NotificationCenterEnabled": "true" if new_global_state else "false"
                 })
+        
+        if hasattr(self, 'schedule_control_all_months_check'):
+            new_state = self.schedule_control_all_months_check.isChecked()
+            if new_state != app_settings.SCHEDULE_CONTROL_ALL_MONTHS:
+                self.save_global_settings_requested.emit({
+                    "ScheduleControlAllMonths": "true" if new_state else "false"
+                })
+                # Aktualizuj lokalnie od razu
+                app_settings.SCHEDULE_CONTROL_ALL_MONTHS = new_state
         
         if hasattr(self, 'history_months_spin'):
             new_history = self.history_months_spin.value()

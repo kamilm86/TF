@@ -2429,7 +2429,10 @@ class WorkScheduleWindow(QMainWindow):
 
         if hasattr(self, 'schedule_control_button'):
             can_see_button = app_settings.has_permission(self.current_user_app_role, 'button_schedule_control')
-            self.schedule_control_button.setVisible(can_see_button and is_next_month_selected)
+            # Jeśli SCHEDULE_CONTROL_ALL_MONTHS = True, przycisk widoczny zawsze
+            # W przeciwnym razie tylko dla następnego miesiąca
+            show_all_months = app_settings.SCHEDULE_CONTROL_ALL_MONTHS
+            self.schedule_control_button.setVisible(can_see_button and (show_all_months or is_next_month_selected))
 
         # --- PRZYCISKI OUTLOOK / TEAMS (Naprawione dla Menadżera) ---
         # Teraz zależą od zaktualizowanego uprawnienia 'button_send_email'
