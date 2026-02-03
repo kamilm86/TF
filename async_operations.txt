@@ -87,6 +87,79 @@ class SuggestionImportThread(QThread):
         self._is_cancelled = True
         debug_print("Otrzymano żądanie anulowania importu sugestii.")
 
+
+class SuggestionImportOutThread(QThread):
+    """
+    Wątek roboczy do asynchronicznego importowania sugestii OUT
+    z procedury p_pobieraniesugestiiout.
+    """
+    # Sygnał emitowany po zakończeniu: sukces (bool)
+    finished = Signal(bool)
+    # Sygnał emitowany przy błędzie krytycznym samego wątku
+    error_occurred = Signal(str)
+
+    def __init__(self, year, month, first_day, logins, parent=None):
+        super().__init__(parent)
+        self.year = year
+        self.month = month
+        self.first_day = first_day  # string 'YYYY-MM-DD'
+        self.logins = logins  # lista loginów przełożonych
+        self._is_cancelled = False
+
+    def run(self):
+        conn = None
+        cursor = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            conn.autocommit = True
+            conn.timeout = 0  # Bez limitu czasu
+            debug_print(f"Ustawiono conn.timeout = 0 dla SuggestionImportOutThread.")
+
+            cursor = conn.cursor()
+
+            # Budowanie parametrów: rok, miesiac, data (pierwszy dzień miesiąca), grupa1, grupa2, ...
+            params_str = ", ".join([f"'{login}'" for login in self.logins])
+            sql = f"EXEC {SQL_OBJECTS['p_pobieraniesugestiiout']} {self.year}, {self.month}, '{self.first_day}', {params_str}"
+
+            debug_print(f"Wywołuję SuggestionImportOutThread: {sql}")
+
+            cursor.execute(sql)
+            
+            # Procedura nie zwraca danych (tylko wykonuje import)
+            while cursor.nextset():
+                pass  # Przetwórz wszystkie resultsets
+
+            if not self._is_cancelled:
+                self.finished.emit(True)
+
+        except pyodbc.Error as e:
+            if "Operation canceled" in str(e) or self._is_cancelled:
+                log_warning(f"Import sugestii OUT anulowany przez użytkownika.")
+                self.finished.emit(False)
+            else:
+                log_error(f"Błąd SQL w SuggestionImportOutThread: {e}", exception=e)
+                if not self._is_cancelled:
+                    self.error_occurred.emit(f"Błąd bazy danych: {e}")
+        except Exception as e:
+            log_error(f"Krytyczny błąd w SuggestionImportOutThread: {e}", exception=e)
+            if not self._is_cancelled:
+                self.error_occurred.emit(f"Błąd aplikacji: {e}")
+        finally:
+            if cursor:
+                cursor.close()
+                debug_print("Zamknięto kursor bazy danych (OUT).")
+
+            if conn:
+                conn.autocommit = False
+                conn.timeout = 30
+                conn.close()
+                debug_print("Przywrócono domyślny stan połączenia (OUT).")
+
+    def cancel(self):
+        """Metoda do anulowania operacji."""
+        self._is_cancelled = True
+        debug_print("Otrzymano żądanie anulowania importu sugestii OUT.")
+
 class LocationExceptionThread(QThread):
     """Wątek roboczy do zarządzania wyjątkami lokalizacyjnymi w tle."""
     progress_updated = Signal(int)

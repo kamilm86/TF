@@ -12,7 +12,7 @@ from config import SQL_OBJECTS
 from debug_utils import log_error, debug_print
 
 # Nowe importy
-from async_operations import SuggestionImportThread
+from async_operations import SuggestionImportThread, SuggestionImportOutThread
 from error_display_dialog import ErrorDisplayDialog
 
 
@@ -583,8 +583,10 @@ class SuggestionsOutDialog(QDialog):
         self.user_app_id = user_app_id
         self.login_windows = login_windows
 
-        # Referencja do okna błędów
+        # Referencja do okna błędów i wątku importu
         self.error_dialog = None
+        self.import_thread = None
+        self.progress_dialog = None
 
         self.setWindowTitle("Sugestie konsultantów out")
 
@@ -679,7 +681,11 @@ class SuggestionsOutDialog(QDialog):
             QMessageBox.critical(self, "Błąd Bazy Danych", f"Nie udało się wczytać listy grup:<br>{e}")
 
     def _get_consultant_suggestions(self):
-        """Pobiera sugestie konsultantów dla zaznaczonych grup."""
+        """Rozpoczyna asynchroniczny import sugestii konsultantów."""
+        if self.import_thread:
+            QMessageBox.warning(self, "Import w toku", "Import sugestii jest już uruchomiony.")
+            return
+
         logins = self._get_selected_groups_logins()
         if not logins:
             return
@@ -691,23 +697,53 @@ class SuggestionsOutDialog(QDialog):
         if reply == QMessageBox.No:
             return
 
-        try:
-            # Budowanie parametrów: rok, miesiac, data (pierwszy dzień miesiąca), grupa1, grupa2, ...
-            first_day = datetime.date(self.year, self.month, 1).strftime('%Y-%m-%d')
-            params_str = ", ".join([f"'{login}'" for login in logins])
-            
-            sql = f"EXEC {SQL_OBJECTS['p_pobieraniesugestiiout']} {self.year}, {self.month}, '{first_day}', {params_str}"
-            debug_print(f"Wykonuję: {sql}")
-            
-            conn = DatabaseConnector.get_connection()
-            conn.execute(sql)
-            conn.commit()
-            conn.close()
-            QMessageBox.information(self, "Sukces", "Sugestie Konsultantów zostały pobrane do grafiku.")
+        # Budowanie parametrów
+        first_day = datetime.date(self.year, self.month, 1).strftime('%Y-%m-%d')
+        debug_print(f"Uruchamianie SuggestionImportOutThread dla {self.year}-{self.month}, grupy: {logins}")
+
+        # Pasek postępu (nieokreślony, bo nie znamy liczby kroków)
+        self.progress_dialog = QProgressDialog("Importowanie sugestii...", "Anuluj", 0, 0, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        self.import_thread = SuggestionImportOutThread(self.year, self.month, first_day, logins)
+        self.import_thread.finished.connect(self._on_suggestion_import_finished)
+        self.import_thread.error_occurred.connect(self._on_suggestion_import_error)
+        self.progress_dialog.canceled.connect(self.import_thread.cancel)
+
+        self.import_thread.start()
+        self.progress_dialog.show()
+
+    def _on_suggestion_import_finished(self, success: bool):
+        """Callback po zakończeniu wątku importu sugestii OUT."""
+        debug_print(f"SuggestionImportOutThread zakończony. Sukces: {success}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.import_thread:
+            self.import_thread.deleteLater()
+            self.import_thread = None
+
+        if success:
             self.data_refresh_needed.emit()
-        except Exception as e:
-            log_error(f"Błąd pobierania sugestii OUT: {e}", exception=e)
-            QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas pobierania sugestii:<br>{e}")
+            QMessageBox.information(self, "Sukces", "Sugestie Konsultantów zostały pobrane do grafiku.")
+
+    def _on_suggestion_import_error(self, error_message: str):
+        """Callback po krytycznym błędzie wątku."""
+        debug_print(f"SuggestionImportOutThread zgłosił błąd krytyczny: {error_message}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.import_thread:
+            self.import_thread.deleteLater()
+            self.import_thread = None
+
+        QMessageBox.critical(self, "Błąd krytyczny importu",
+                             f"Wystąpił błąd krytyczny podczas importu sugestii:\n{error_message}")
 
     def _get_vacation_plans(self):
         """Pobiera plany urlopowe dla zaznaczonych grup."""
