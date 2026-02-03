@@ -100,8 +100,28 @@ class ErrorDisplayDialog(QDialog):
         table_style = AppStyles.get_table_style(theme)
         button_style = AppStyles.get_button_style(theme)
 
+        # Dodatkowy styl dla nagłówków QTableWidget (nie jest objęty domyślnym stylem)
+        if theme == "dark":
+            header_text_color = AppStyles.DARK_TEXT_PRIMARY
+            header_bg = AppStyles.DARK_BACKGROUND_PRESSED
+            header_border = AppStyles.DARK_BORDER_SECONDARY
+        else:
+            header_text_color = AppStyles.LIGHT_TEXT_PRIMARY
+            header_bg = "#e0e0e0"
+            header_border = AppStyles.LIGHT_BORDER_PRIMARY
+        
+        header_style = f"""
+            QHeaderView::section {{
+                background-color: {header_bg};
+                color: {header_text_color};
+                border: 1px solid {header_border};
+                padding: 4px;
+                font-weight: bold;
+            }}
+        """
+
         # Musimy połączyć style, aby QTableWidget też był objęty
-        self.setStyleSheet(dialog_style + table_style)
+        self.setStyleSheet(dialog_style + table_style + header_style)
 
         self.close_button.setStyleSheet(button_style)
 
