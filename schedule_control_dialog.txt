@@ -511,12 +511,11 @@ class ScheduleControlDialog(QDialog):
 
             # Zapytanie do trwałej tabeli logów
             sql = f"""
-                SELECT NrKadrowy, Uzytkownik, DataSugestii, Symbol, KomentarzBledu, DataLogu
+                SELECT nrKadrowy, Pracownik, Data, Symbol, Komunikat
                 FROM {SQL_OBJECTS['logsugestieimportin']}
-                WHERE Rok = ? AND Miesiac = ?
-                ORDER BY DataLogu DESC
+                ORDER BY Data DESC
             """
-            cursor.execute(sql, (self.year, self.month))
+            cursor.execute(sql)
 
             errors = cursor.fetchall()
             headers = [col[0] for col in cursor.description] if cursor.description else []
@@ -660,7 +659,7 @@ class SuggestionsOutDialog(QDialog):
         query = f"""
             SELECT DISTINCT UzytkownikDane, Uzytkownik 
             FROM {SQL_OBJECTS['konfiguracjazatrudnienie']}
-            WHERE UzytkownikDane IS NOT NULL AND Uzytkownik IS NOT NULL
+            WHERE Uzytkownik IS NOT NULL AND Rola = 4 AND Jednostka = 4
             ORDER BY UzytkownikDane
             """
         try:
@@ -693,11 +692,11 @@ class SuggestionsOutDialog(QDialog):
             return
 
         try:
-            # Budowanie parametrów: rok, miesiac, data, grupa1, grupa2, ...
-            current_date = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # Budowanie parametrów: rok, miesiac, data (pierwszy dzień miesiąca), grupa1, grupa2, ...
+            first_day = datetime.date(self.year, self.month, 1).strftime('%Y-%m-%d')
             params_str = ", ".join([f"'{login}'" for login in logins])
             
-            sql = f"EXEC {SQL_OBJECTS['p_pobieraniesugestiiout']} {self.year}, {self.month}, '{current_date}', {params_str}"
+            sql = f"EXEC {SQL_OBJECTS['p_pobieraniesugestiiout']} {self.year}, {self.month}, '{first_day}', {params_str}"
             debug_print(f"Wykonuję: {sql}")
             
             conn = DatabaseConnector.get_connection()
@@ -747,12 +746,11 @@ class SuggestionsOutDialog(QDialog):
 
             # Zapytanie do trwałej tabeli logów
             sql = f"""
-                SELECT NrKadrowy, Uzytkownik, DataSugestii, Symbol, KomentarzBledu, DataLogu
-                FROM {SQL_OBJECTS['logsugestieimportin']}
-                WHERE Rok = ? AND Miesiac = ?
-                ORDER BY DataLogu DESC
+                SELECT nrKadrowy, Pracownik, Data, Symbol, Komunikat
+                FROM {SQL_OBJECTS['logsugestieimportout']}
+                ORDER BY Data
             """
-            cursor.execute(sql, (self.year, self.month))
+            cursor.execute(sql)
 
             errors = cursor.fetchall()
             headers = [col[0] for col in cursor.description] if cursor.description else []
