@@ -251,7 +251,7 @@ class ScheduleControlDialog(QDialog):
             return
 
         try:
-            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, '{self.login_windows}', NULL"
+            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, 1, 0"
             conn = DatabaseConnector.get_connection()
             conn.execute(sql)
             conn.commit()
@@ -511,9 +511,9 @@ class ScheduleControlDialog(QDialog):
 
             # Zapytanie do trwałej tabeli logów
             sql = f"""
-                SELECT nrKadrowy, Pracownik, Data, Symbol, Komunikat
+                SELECT Id, nrKadrowy, Pracownik, Data, Symbol, Komunikat
                 FROM {SQL_OBJECTS['logsugestieimportin']}
-                ORDER BY Data DESC
+                ORDER BY Data
             """
             cursor.execute(sql)
 
@@ -760,7 +760,7 @@ class SuggestionsOutDialog(QDialog):
 
         try:
             params_str = ", ".join([f"'{login}'" for login in logins])
-            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, '{self.user_app_id}', {params_str}"
+            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, 2, 0, {params_str}"
             conn = DatabaseConnector.get_connection()
             conn.execute(sql)
             conn.commit()
@@ -782,7 +782,7 @@ class SuggestionsOutDialog(QDialog):
 
             # Zapytanie do trwałej tabeli logów
             sql = f"""
-                SELECT nrKadrowy, Pracownik, Data, Symbol, Komunikat
+                SELECT Id, nrKadrowy, Pracownik, Data, Symbol, Komunikat, Rok, Miesiac, Przelozony
                 FROM {SQL_OBJECTS['logsugestieimportout']}
                 ORDER BY Data
             """
