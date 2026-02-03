@@ -313,7 +313,7 @@ class ScheduleControlDialog(QDialog):
             self.save_blocking_date_button.setText("Ustaw datę blokady")
             # --- KONIEC POPRAWKI ---
 
-            first_day_of_month = datetime.date(self.year, self.month, 1)
+            first_day_of_month = datetime.date(self.year, self.month, 1).strftime('%Y-%m-%d')  # String dla kompatybilności ze starym ODBC
             query_block = f"SELECT DataBlokowania FROM {SQL_OBJECTS['datyblokowaniapu']} WHERE ZablokowanaData = ?"
             block_date_row = cursor.execute(query_block, (first_day_of_month,)).fetchone()
 
@@ -415,7 +415,7 @@ class ScheduleControlDialog(QDialog):
 
         except Exception as e:
             log_error(f"Błąd podczas zmiany statusu sugestii na {status_code}: {e}", exception=e)
-            QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas zmiany statusu sugestii:\<br>{e}")
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas zmiany statusu sugestii:<br>{e}")
 
     def publish_schedule(self):
         sql = f"exec {SQL_OBJECTS['p_publikowaniegrafiku']} {self.year}, {self.month}, '{self.login_windows}', 1"
@@ -575,6 +575,7 @@ class SuggestionsOutDialog(QDialog):
         self.year = year
         self.month = month
         self.is_dark_theme = getattr(parent, 'is_dark_theme', False)
+        self.data_provider = parent.data_provider
 
         self.setWindowFlags(
             Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
@@ -582,6 +583,9 @@ class SuggestionsOutDialog(QDialog):
         user_app_id, _, _, _, login_windows = get_modifier_id()
         self.user_app_id = user_app_id
         self.login_windows = login_windows
+
+        # Referencja do okna błędów
+        self.error_dialog = None
 
         self.setWindowTitle("Sugestie konsultantów out")
 
@@ -596,8 +600,10 @@ class SuggestionsOutDialog(QDialog):
         data_box = QGroupBox("Pobieranie danych")
         data_layout = QVBoxLayout()
         self.get_suggestions_button = QPushButton("Pobierz sugestie Konsultantów")
+        self.view_logs_button = QPushButton("Pokaż historię błędów importu")
         self.get_vacation_plans_button = QPushButton("Pobierz plany urlopowe")
         data_layout.addWidget(self.get_suggestions_button)
+        data_layout.addWidget(self.view_logs_button)
         data_layout.addWidget(self.get_vacation_plans_button)
         data_box.setLayout(data_layout)
 
@@ -620,6 +626,7 @@ class SuggestionsOutDialog(QDialog):
     def connect_signals(self):
         self.close_button.clicked.connect(self.accept)
         self.get_suggestions_button.clicked.connect(self._get_consultant_suggestions)
+        self.view_logs_button.clicked.connect(self._show_historical_logs)
         self.get_vacation_plans_button.clicked.connect(self._get_vacation_plans)
 
     def set_current_theme(self, is_dark_theme: bool):
@@ -627,6 +634,8 @@ class SuggestionsOutDialog(QDialog):
         if self.is_dark_theme != is_dark_theme:
             self.is_dark_theme = is_dark_theme
             self.apply_styles()
+            if self.error_dialog:
+                self.error_dialog.set_current_theme(is_dark_theme)
 
     def apply_styles(self):
         theme = "dark" if self.is_dark_theme else "light"
@@ -635,20 +644,24 @@ class SuggestionsOutDialog(QDialog):
             button.setStyleSheet(AppStyles.get_button_style(theme))
         self.groups_list.setStyleSheet(AppStyles.get_list_style(theme))
 
-    def _get_selected_groups_str(self):
-        """Zwraca string z wybranymi grupami, gotowy do użycia w SQL."""
-        selected_items = [item.text() for item in self.groups_list.selectedItems()]
+    def _get_selected_groups_logins(self):
+        """Zwraca listę loginów (Uzytkownik) z zaznaczonych elementów."""
+        selected_items = self.groups_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "Brak zaznaczenia", "Proszę wybrać co najmniej jedną grupę z listy.")
             return None
-        return ",".join([f"'{item}'" for item in selected_items])
+        # Pobieramy userData (login Uzytkownik) z każdego zaznaczonego elementu
+        logins = [item.data(Qt.UserRole) for item in selected_items if item.data(Qt.UserRole)]
+        return logins
 
     def _load_groups(self):
-        """Ładuje listę grup (przełożonych) na podstawie logiki VBA."""
+        """Ładuje listę grup (przełożonych) - wyświetla UzytkownikDane, przechowuje Uzytkownik jako userData."""
         self.groups_list.clear()
         query = f"""
-            SELECT distinct PrzelozonyDane 
+            SELECT DISTINCT UzytkownikDane, Uzytkownik 
             FROM {SQL_OBJECTS['konfiguracjazatrudnienie']}
+            WHERE UzytkownikDane IS NOT NULL AND Uzytkownik IS NOT NULL
+            ORDER BY UzytkownikDane
             """
         try:
             conn = DatabaseConnector.get_connection()
@@ -656,14 +669,21 @@ class SuggestionsOutDialog(QDialog):
             results = cursor.execute(query).fetchall()
             conn.close()
             for row in results:
-                self.groups_list.addItem(row[0])
+                display_name = row[0]  # UzytkownikDane - do wyświetlenia
+                przelozony = row[1]          # Uzytkownik - jako parametr
+                from PySide6.QtWidgets import QListWidgetItem
+                item = QListWidgetItem(display_name)
+                item.setData(Qt.UserRole, przelozony)  # Przechowujemy login jako userData
+                self.groups_list.addItem(item)
         except Exception as e:
+            log_error(f"Błąd ładowania listy grup: {e}", exception=e)
             QMessageBox.critical(self, "Błąd Bazy Danych", f"Nie udało się wczytać listy grup:<br>{e}")
 
     def _get_consultant_suggestions(self):
-        """Adaptacja logiki VBA dla przycisku 'Pobierz sugestie Konsultantów'."""
-        selected_groups_str = self._get_selected_groups_str()
-        if not selected_groups_str: return
+        """Pobiera sugestie konsultantów dla zaznaczonych grup."""
+        logins = self._get_selected_groups_logins()
+        if not logins:
+            return
 
         reply = show_confirmation_dialog(self, "Potwierdzenie",
                                          "Czy na pewno chcesz pobrać sugestie? Może to spowodować nadpisanie wprowadzonych już danych.",
@@ -673,7 +693,13 @@ class SuggestionsOutDialog(QDialog):
             return
 
         try:
-            sql = f"EXEC {SQL_OBJECTS['p_pobieraniesugestiiout']} {self.year}, {self.month}, '{self.user_app_id}', {selected_groups_str}"
+            # Budowanie parametrów: rok, miesiac, data, grupa1, grupa2, ...
+            current_date = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            params_str = ", ".join([f"'{login}'" for login in logins])
+            
+            sql = f"EXEC {SQL_OBJECTS['p_pobieraniesugestiiout']} {self.year}, {self.month}, '{current_date}', {params_str}"
+            debug_print(f"Wykonuję: {sql}")
+            
             conn = DatabaseConnector.get_connection()
             conn.execute(sql)
             conn.commit()
@@ -681,12 +707,13 @@ class SuggestionsOutDialog(QDialog):
             QMessageBox.information(self, "Sukces", "Sugestie Konsultantów zostały pobrane do grafiku.")
             self.data_refresh_needed.emit()
         except Exception as e:
+            log_error(f"Błąd pobierania sugestii OUT: {e}", exception=e)
             QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas pobierania sugestii:<br>{e}")
 
     def _get_vacation_plans(self):
-        """Adaptacja logiki VBA dla przycisku 'Pobierz plany urlopowe'."""
-        selected_groups_str = self._get_selected_groups_str()
-        if not selected_groups_str:
+        """Pobiera plany urlopowe dla zaznaczonych grup."""
+        logins = self._get_selected_groups_logins()
+        if not logins:
             return
 
         reply = show_confirmation_dialog(self, "Potwierdzenie",
@@ -697,7 +724,8 @@ class SuggestionsOutDialog(QDialog):
             return
 
         try:
-            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, '{self.user_app_id}', {selected_groups_str}"
+            params_str = ", ".join([f"'{login}'" for login in logins])
+            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, '{self.user_app_id}', {params_str}"
             conn = DatabaseConnector.get_connection()
             conn.execute(sql)
             conn.commit()
@@ -705,5 +733,60 @@ class SuggestionsOutDialog(QDialog):
             QMessageBox.information(self, "Sukces", "Plany urlopowe zostały pobrane.")
             self.data_refresh_needed.emit()
         except Exception as e:
+            log_error(f"Błąd pobierania planów urlopowych OUT: {e}", exception=e)
             QMessageBox.critical(self, "Błąd Bazy Danych",
                                  f"Wystąpił błąd podczas pobierania planów urlopowych:<br>{e}")
+
+    def _show_historical_logs(self):
+        """Pobiera i wyświetla historyczne logi błędów importu."""
+        debug_print(f"Pobieranie historycznych logów błędów OUT dla {self.year}-{self.month}")
+        conn = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            cursor = conn.cursor()
+
+            # Zapytanie do trwałej tabeli logów
+            sql = f"""
+                SELECT NrKadrowy, Uzytkownik, DataSugestii, Symbol, KomentarzBledu, DataLogu
+                FROM {SQL_OBJECTS['logsugestieimportin']}
+                WHERE Rok = ? AND Miesiac = ?
+                ORDER BY DataLogu DESC
+            """
+            cursor.execute(sql, (self.year, self.month))
+
+            errors = cursor.fetchall()
+            headers = [col[0] for col in cursor.description] if cursor.description else []
+
+            if not errors:
+                QMessageBox.information(self, "Brak logów",
+                                        f"Nie znaleziono zapisanych błędów importu dla {self.year}-{self.month}.")
+                return
+
+            # Wyświetl błędy w oknie dialogowym
+            self._show_error_dialog(errors, headers)
+
+        except Exception as e:
+            log_error(f"Błąd podczas pobierania historycznych logów OUT: {e}", exception=e)
+            QMessageBox.critical(self, "Błąd Bazy Danych", f"Nie udało się pobrać logów błędów:<br>{e}")
+        finally:
+            if conn:
+                conn.close()
+
+    def _show_error_dialog(self, errors: list, headers: list):
+        """Tworzy lub aktywuje okno dialogowe z błędami."""
+        try:
+            if self.error_dialog:
+                self.error_dialog.activateWindow()
+                self.error_dialog.raise_()
+            else:
+                self.error_dialog = ErrorDisplayDialog(errors, headers, self.parent_widget)
+                self.error_dialog.finished.connect(self._on_error_dialog_closed)
+                self.error_dialog.set_current_theme(self.is_dark_theme)
+                self.error_dialog.show()
+        except Exception as e:
+            log_error(f"Nie można wyświetlić okna błędów OUT: {e}", exception=e)
+
+    def _on_error_dialog_closed(self):
+        """Callback czyszczący referencję do okna błędów."""
+        debug_print("Okno błędów OUT zostało zamknięte.")
+        self.error_dialog = None
