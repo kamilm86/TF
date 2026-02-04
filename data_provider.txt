@@ -589,7 +589,7 @@ class DataProvider(QObject):
                         e.get('type') == 'Szkolenie' and e.get('status') == 'Delegowany' for e in
                         events_for_cell) else 0
                     day_data_dict['events'] = active_events
-                    debug_print(f"Dodano ikonę nadgodzin w dniu wolnym dla user_id: {user_id}, dzień: {day}")
+                    # debug_print(f"Dodano ikonę nadgodzin w dniu wolnym dla user_id: {user_id}, dzień: {day}")
 
             except (ValueError, IndexError) as e:
                 log_warning(f"Błąd przetwarzania zdarzenia dla dnia wolnego ({user_id}, {date_str}): {e}")

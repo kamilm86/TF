@@ -396,19 +396,19 @@ class AppSettingsDialog(QDialog):
             app_settings.parse_and_apply('GroupMapping', new_mapping_json)
             QMessageBox.information(self, "Zapisano", "Konfiguracja grup została zaktualizowana i wysłana do bazy.")
 
-        group.setLayout(layout)
-        return group
-
     def _create_admin_group(self):
         group = QGroupBox("Ustawienia Globalne Aplikacji")
         group.setStyleSheet(
             "QGroupBox { border: 1px solid #e74c3c; margin-top: 10px; } QGroupBox::title { color: #e74c3c; }")
         layout = QGridLayout()
         
+        row = 0
+        
         # 1. Centrum Powiadomień
         self.global_notification_check = QCheckBox("Włącz Centrum Powiadomień (dla wszystkich użytkowników)")
         self.global_notification_check.setChecked(app_settings.ENABLE_NOTIFICATION_CENTER)
-        layout.addWidget(self.global_notification_check, 0, 0, 1, 2)
+        layout.addWidget(self.global_notification_check, row, 0, 1, 2)
+        row += 1
         
         # 2. Zarządzaj Grafikiem - widoczność dla wszystkich miesięcy
         self.schedule_control_all_months_check = QCheckBox("Pokaż \"Zarządzaj Grafikiem\" dla wszystkich miesięcy")
@@ -416,22 +416,66 @@ class AppSettingsDialog(QDialog):
         self.schedule_control_all_months_check.setToolTip(
             "Domyślnie przycisk jest widoczny tylko dla następnego miesiąca.\n"
             "Zaznacz, aby przycisk był widoczny dla wszystkich miesięcy.")
-        layout.addWidget(self.schedule_control_all_months_check, 1, 0, 1, 2)
+        layout.addWidget(self.schedule_control_all_months_check, row, 0, 1, 2)
+        row += 1
         
         # 3. Historia Grafiku
-        layout.addWidget(QLabel("Liczba miesięcy wstecz w grafiku:"), 2, 0)
+        layout.addWidget(QLabel("Liczba miesięcy wstecz w grafiku:"), row, 0)
         self.history_months_spin = QSpinBox()
         self.history_months_spin.setRange(1, 24)
         self.history_months_spin.setSuffix(" mies.")
         self.history_months_spin.setValue(getattr(app_settings, 'HISTORY_MONTHS', 3))
         self.history_months_spin.setToolTip("Określa ile miesięcy wstecz jest widocznych na liście wyboru daty.")
-        layout.addWidget(self.history_months_spin, 2, 1)
+        layout.addWidget(self.history_months_spin, row, 1)
+        row += 1
+        
+        # --- SEKCJA LOGOWANIA ---
+        logging_separator = QLabel("<b>─── Ustawienia Logowania ───</b>")
+        logging_separator.setStyleSheet("margin-top: 10px; color: #3498db;")
+        layout.addWidget(logging_separator, row, 0, 1, 2)
+        row += 1
+        
+        logging_info = QLabel("<i>Podaj loginy Windows oddzielone przecinkami. Pusta lista = wyłączone (dla crashów = wszyscy).</i>")
+        logging_info.setWordWrap(True)
+        logging_info.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(logging_info, row, 0, 1, 2)
+        row += 1
+        
+        # 4. Logowanie do pliku
+        layout.addWidget(QLabel("Logowanie do pliku:"), row, 0)
+        self.logging_file_edit = QLineEdit()
+        self.logging_file_edit.setPlaceholderText("np. kamil,jan,admin")
+        self.logging_file_edit.setText(','.join(sorted(app_settings.LOGGING_USERS_FILE)))
+        self.logging_file_edit.setToolTip("Użytkownicy dla których zapisywane są logi do pliku w folderze Pobrane/TeamFlowAppLogs")
+        layout.addWidget(self.logging_file_edit, row, 1)
+        row += 1
+        
+        # 5. Logowanie do konsoli
+        layout.addWidget(QLabel("Logowanie do konsoli:"), row, 0)
+        self.logging_console_edit = QLineEdit()
+        self.logging_console_edit.setPlaceholderText("np. kamil,developer")
+        self.logging_console_edit.setText(','.join(sorted(app_settings.LOGGING_USERS_CONSOLE)))
+        self.logging_console_edit.setToolTip("Użytkownicy dla których wyświetlane są logi w konsoli (debug)")
+        layout.addWidget(self.logging_console_edit, row, 1)
+        row += 1
+        
+        # 6. Logowanie crashów
+        layout.addWidget(QLabel("Logowanie crashów:"), row, 0)
+        self.logging_crash_edit = QLineEdit()
+        self.logging_crash_edit.setPlaceholderText("puste = wszyscy")
+        self.logging_crash_edit.setText(','.join(sorted(app_settings.LOGGING_USERS_CRASH)))
+        self.logging_crash_edit.setToolTip("Użytkownicy dla których zapisywane są crash logi. Puste = wszyscy użytkownicy.")
+        layout.addWidget(self.logging_crash_edit, row, 1)
+        row += 1
+        
+        # --- KONIEC SEKCJI LOGOWANIA ---
 
-        layout.addWidget(QLabel("<i>Zmiana tych ustawień wpłynie na wszystkich użytkowników aplikacji.</i>"), 3, 0, 1, 2)
+        layout.addWidget(QLabel("<i>Zmiana tych ustawień wpłynie na wszystkich użytkowników aplikacji.</i>"), row, 0, 1, 2)
+        row += 1
         
         self.edit_permissions_btn = QPushButton("Edytuj Uprawnienia Ról")
         self.edit_permissions_btn.clicked.connect(self.open_permissions_editor)
-        layout.addWidget(self.edit_permissions_btn, 4, 0, 1, 2)
+        layout.addWidget(self.edit_permissions_btn, row, 0, 1, 2)
         
         group.setLayout(layout)
         return group
@@ -483,6 +527,38 @@ class AppSettingsDialog(QDialog):
                  self.save_global_settings_requested.emit({
                     "HistoryMonths": str(new_history)
                 })
+        
+        # --- ZAPIS USTAWIEŃ LOGOWANIA ---
+        if hasattr(self, 'logging_file_edit'):
+            new_logging_file = self.logging_file_edit.text().strip()
+            current_logging_file = ','.join(sorted(app_settings.LOGGING_USERS_FILE))
+            if new_logging_file != current_logging_file:
+                self.save_global_settings_requested.emit({
+                    "LoggingUserFile": new_logging_file
+                })
+                app_settings.parse_and_apply('LoggingUserFile', new_logging_file)
+                debug_print(f"Zaktualizowano LoggingUserFile: {new_logging_file}")
+        
+        if hasattr(self, 'logging_console_edit'):
+            new_logging_console = self.logging_console_edit.text().strip()
+            current_logging_console = ','.join(sorted(app_settings.LOGGING_USERS_CONSOLE))
+            if new_logging_console != current_logging_console:
+                self.save_global_settings_requested.emit({
+                    "LoggingUserConsole": new_logging_console
+                })
+                app_settings.parse_and_apply('LoggingUserConsole', new_logging_console)
+                debug_print(f"Zaktualizowano LoggingUserConsole: {new_logging_console}")
+        
+        if hasattr(self, 'logging_crash_edit'):
+            new_logging_crash = self.logging_crash_edit.text().strip()
+            current_logging_crash = ','.join(sorted(app_settings.LOGGING_USERS_CRASH))
+            if new_logging_crash != current_logging_crash:
+                self.save_global_settings_requested.emit({
+                    "LoggingUserCrash": new_logging_crash
+                })
+                app_settings.parse_and_apply('LoggingUserCrash', new_logging_crash)
+                debug_print(f"Zaktualizowano LoggingUserCrash: {new_logging_crash}")
+        # --- KONIEC ZAPISU USTAWIEŃ LOGOWANIA ---
             
         self.accept()
 

@@ -1,0 +1,355 @@
+# crash_handler.py
+# -*- coding: utf-8 -*-
+"""
+Moduł obsługi crashów aplikacji TeamFlowApp.
+
+Instaluje globalne handlery do przechwytywania:
+- Nieobsłużonych wyjątków Python (sys.excepthook)
+- Zakończeń procesu (atexit)
+- Segfaults C++/Qt (faulthandler)
+
+Użycie:
+    from crash_handler import install_crash_handlers, set_session_manager
+    
+    install_crash_handlers()  # Wywołaj PRZED QApplication
+    ...
+    set_session_manager(session_manager)  # Po utworzeniu SessionManager
+"""
+
+import sys
+import atexit
+import traceback
+import faulthandler
+from typing import Optional, TYPE_CHECKING
+from pathlib import Path
+from datetime import datetime
+
+if TYPE_CHECKING:
+    from session_manager import SessionManager
+
+# Globalna referencja do session managera (ustawiana później)
+_session_manager: Optional['SessionManager'] = None
+
+# Flaga informująca czy closeEvent został poprawnie wywołany
+_clean_exit_flag = False
+
+# Flaga kontrolująca czy logowanie crashów do pliku jest włączone
+_crash_logging_enabled = True  # Domyślnie włączone (bezpieczeństwo)
+
+# Oryginalny excepthook do przywrócenia
+_original_excepthook = sys.excepthook
+
+
+def set_crash_logging_enabled(enabled: bool) -> None:
+    """
+    Włącza lub wyłącza logowanie crashów do pliku.
+    
+    Wywoływane po załadowaniu app_settings, jeśli użytkownik nie jest na liście LOGGING_USERS_CRASH.
+    """
+    global _crash_logging_enabled
+    _crash_logging_enabled = enabled
+    _debug_log(f"Crash handler: Logowanie crashów do pliku {'WŁĄCZONE' if enabled else 'WYŁĄCZONE'}")
+
+
+def set_session_manager(sm: 'SessionManager') -> None:
+    """
+    Ustawia referencję do SessionManager dla zapisu crash info do bazy.
+    
+    Wywoływane po utworzeniu głównego okna aplikacji.
+    """
+    global _session_manager
+    _session_manager = sm
+    _debug_log("Crash handler: SessionManager ustawiony.")
+
+
+def mark_clean_exit() -> None:
+    """
+    Oznacza że aplikacja zamyka się w sposób kontrolowany (przez closeEvent).
+    
+    Wywoływane w closeEvent głównego okna.
+    """
+    global _clean_exit_flag
+    _clean_exit_flag = True
+    _debug_log("Crash handler: Oznaczono czyste zamknięcie.")
+
+
+def install_crash_handlers() -> None:
+    """
+    Instaluje wszystkie globalne handlery crashów.
+    
+    MUSI być wywołana PRZED utworzeniem QApplication.
+    """
+    global _faulthandler_file
+    
+    _debug_log("Crash handler: Instalowanie handlerów...")
+    
+    # 1. Global exception hook dla nieobsłużonych wyjątków Python
+    sys.excepthook = _global_exception_hook
+    _debug_log("Crash handler: sys.excepthook zainstalowany.")
+    
+    # 2. Threading exception hook (dla wyjątków w wątkach - Python 3.8+)
+    if hasattr(sys, 'threading_excepthook'):
+        import threading
+        threading.excepthook = _threading_exception_hook
+        _debug_log("Crash handler: threading.excepthook zainstalowany.")
+    
+    # 3. Atexit handler dla każdego zakończenia procesu
+    atexit.register(_atexit_handler)
+    _debug_log("Crash handler: atexit handler zarejestrowany.")
+    
+    # 4. Faulthandler dla segfaults C++/Qt
+    try:
+        crash_log_path = _get_crash_log_path()
+        if crash_log_path:
+            crash_log_path.parent.mkdir(parents=True, exist_ok=True)
+            _faulthandler_file = open(crash_log_path, 'a', encoding='utf-8')
+            faulthandler.enable(file=_faulthandler_file)
+            _debug_log(f"Crash handler: faulthandler włączony (plik: {crash_log_path})")
+        else:
+            faulthandler.enable()
+            _debug_log("Crash handler: faulthandler włączony (stderr)")
+    except Exception as e:
+        _debug_log(f"Crash handler: Nie udało się włączyć faulthandler: {e}")
+    
+    _debug_log("Crash handler: Wszystkie handlery zainstalowane.")
+
+
+def install_qt_message_handler():
+    """
+    Instaluje Qt Message Handler do przechwytywania qWarning/qCritical/qFatal.
+    
+    MUSI być wywołana PO utworzeniu QApplication.
+    """
+    try:
+        from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+        
+        def qt_message_handler(msg_type, context, message):
+            """Handler dla komunikatów Qt."""
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Klasyfikacja komunikatów
+            type_names = {
+                QtMsgType.QtDebugMsg: "DEBUG",
+                QtMsgType.QtInfoMsg: "INFO",
+                QtMsgType.QtWarningMsg: "WARNING",
+                QtMsgType.QtCriticalMsg: "CRITICAL",
+                QtMsgType.QtFatalMsg: "FATAL"
+            }
+            type_name = type_names.get(msg_type, "UNKNOWN")
+            
+            # Formatuj pełny komunikat
+            full_message = f"[{timestamp}][Qt {type_name}] {message}"
+            if context.file:
+                full_message += f" ({context.file}:{context.line})"
+            
+            # Loguj WARNING, CRITICAL i FATAL do pliku crash.log
+            if msg_type in (QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+                _write_to_crash_log(full_message)
+                
+                # Dla FATAL i niektórych CRITICAL - zapisz do bazy
+                if msg_type == QtMsgType.QtFatalMsg or "Destroyed while thread" in message:
+                    if _session_manager and _session_manager.session_id:
+                        try:
+                            _session_manager.end_session(
+                                exit_type="QtCrash", 
+                                crash_info=f"Qt {type_name}: {message[:3900]}"
+                            )
+                        except Exception:
+                            pass
+            
+            # Zawsze wypisz do konsoli
+            print(full_message, file=sys.stderr if msg_type >= QtMsgType.QtWarningMsg else sys.stdout)
+        
+        qInstallMessageHandler(qt_message_handler)
+        _debug_log("Crash handler: Qt Message Handler zainstalowany.")
+        
+    except ImportError as e:
+        _debug_log(f"Crash handler: Nie można zainstalować Qt Message Handler (PySide6 niedostępne): {e}")
+    except Exception as e:
+        _debug_log(f"Crash handler: Błąd instalacji Qt Message Handler: {e}")
+
+
+def _threading_exception_hook(args):
+    """
+    Handler dla nieobsłużonych wyjątków w wątkach (Python 3.8+).
+    """
+    exc_type = args.exc_type
+    exc_value = args.exc_value
+    exc_tb = args.exc_traceback
+    thread = args.thread
+    
+    # Ignoruj SystemExit w wątkach
+    if issubclass(exc_type, SystemExit):
+        return
+    
+    thread_name = thread.name if thread else "Unknown"
+    error_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+    error_message = ''.join(error_lines)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    crash_info = f"[{timestamp}] WYJĄTEK W WĄTKU '{thread_name}':\n{error_message}"
+    
+    # Loguj
+    try:
+        from debug_utils import log_error
+        log_error(f"Wyjątek w wątku '{thread_name}':\n{error_message}")
+    except ImportError:
+        print(crash_info, file=sys.stderr)
+    
+    # Zapisz do crash.log
+    _write_to_crash_log(crash_info)
+    
+    # Zapisz do bazy
+    if _session_manager and _session_manager.session_id:
+        try:
+            _session_manager.end_session(
+                exit_type="ThreadCrash", 
+                crash_info=f"Wątek '{thread_name}': {error_message[:3900]}"
+            )
+        except Exception:
+            pass
+
+
+def _write_to_crash_log(message: str) -> None:
+    """
+    Zapisuje komunikat do pliku crash.log z wymuszonym flush.
+    Respektuje ustawienie _crash_logging_enabled.
+    """
+    if not _crash_logging_enabled:
+        return
+        
+    try:
+        crash_log_path = _get_crash_log_path()
+        if crash_log_path:
+            crash_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(crash_log_path, 'a', encoding='utf-8') as f:
+                f.write(message + "\n")
+                f.flush()
+    except Exception:
+        pass
+
+
+# Globalna zmienna dla faulthandler file (aby móc ją zamknąć)
+_faulthandler_file = None
+
+
+def _global_exception_hook(exc_type, exc_value, exc_tb) -> None:
+    """
+    Globalny handler nieobsłużonych wyjątków Python.
+    
+    Loguje pełny traceback i zapisuje crash info do bazy (jeśli możliwe).
+    """
+    # Ignoruj KeyboardInterrupt (Ctrl+C)
+    if issubclass(exc_type, KeyboardInterrupt):
+        _original_excepthook(exc_type, exc_value, exc_tb)
+        return
+    
+    # Formatuj pełny traceback
+    error_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+    error_message = ''.join(error_lines)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    crash_header = f"\n{'='*60}\n[{timestamp}] NIEOBSŁUŻONY WYJĄTEK - CRASH\n{'='*60}\n"
+    full_crash_info = crash_header + error_message
+    
+    # 1. Loguj do pliku (przez debug_utils jeśli dostępne)
+    try:
+        from debug_utils import log_error
+        log_error(f"CRASH - Nieobsłużony wyjątek:\n{error_message}")
+    except ImportError:
+        # Fallback: print do stderr
+        print(full_crash_info, file=sys.stderr)
+    
+    # 2. Zapisz do bazy przez SessionManager
+    if _session_manager:
+        try:
+            # Skracamy crash_info do 4000 znaków (limit SQL)
+            truncated_info = error_message[:4000] if len(error_message) > 4000 else error_message
+            _session_manager.end_session(exit_type="Crash", crash_info=truncated_info)
+            _debug_log("Crash handler: Zapisano crash info do bazy.")
+        except Exception as db_error:
+            _debug_log(f"Crash handler: Błąd zapisu do bazy: {db_error}")
+    
+    # 3. Zapisz do osobnego pliku crash.log
+    try:
+        crash_log_path = _get_crash_log_path()
+        if crash_log_path:
+            with open(crash_log_path, 'a', encoding='utf-8') as f:
+                f.write(full_crash_info)
+    except Exception:
+        pass  # Cichy błąd - główne logowanie już wykonane
+    
+    # 4. Wywołaj oryginalny handler (pokaże dialog błędu systemowego)
+    _original_excepthook(exc_type, exc_value, exc_tb)
+
+
+def _atexit_handler() -> None:
+    """
+    Handler wywoływany przy każdym zakończeniu procesu Python.
+    
+    Sprawdza czy było to czyste zamknięcie i loguje informację.
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if _clean_exit_flag:
+        # Normalne zamknięcie - nic specjalnego do zrobienia
+        _debug_log("Crash handler: atexit - czyste zamknięcie.")
+        return
+    
+    # Nieczyste zamknięcie (bez closeEvent)
+    warning_msg = f"[{timestamp}] OSTRZEŻENIE: Aplikacja zamknięta bez closeEvent (możliwy crash lub wymuszenie)"
+    
+    try:
+        from debug_utils import log_warning
+        log_warning(warning_msg)
+    except ImportError:
+        print(warning_msg, file=sys.stderr)
+    
+    # Spróbuj zapisać do bazy jeśli sesja nie była zamknięta
+    if _session_manager and _session_manager.session_id:
+        try:
+            _session_manager.end_session(exit_type="UnexpectedExit", crash_info="Zamknięcie bez closeEvent")
+            _debug_log("Crash handler: Zapisano UnexpectedExit do bazy.")
+        except Exception as e:
+            _debug_log(f"Crash handler: Błąd zapisu UnexpectedExit: {e}")
+
+
+def _get_crash_log_path() -> Optional[Path]:
+    """
+    Zwraca ścieżkę do pliku crash.log w folderze logów aplikacji.
+    """
+    try:
+        # Użyj tej samej logiki co debug_utils
+        if sys.platform == "win32":
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+            )
+            downloads_guid = '{374DE290-123F-4565-9164-39C4925E467B}'
+            path, _ = winreg.QueryValueEx(key, downloads_guid)
+            winreg.CloseKey(key)
+            import os
+            downloads_dir = Path(os.path.expandvars(path))
+        else:
+            downloads_dir = Path.home() / "Downloads"
+        
+        logs_dir = downloads_dir / "TeamFlowAppLogs"
+        today = datetime.now().strftime("%Y-%m-%d")
+        return logs_dir / f"crash_{today}.log"
+        
+    except Exception:
+        return None
+
+
+def _debug_log(message: str) -> None:
+    """
+    Wewnętrzne logowanie dla crash handlera.
+    
+    Używa debug_utils jeśli dostępne, w przeciwnym razie print.
+    """
+    try:
+        from debug_utils import debug_print
+        debug_print(message)
+    except ImportError:
+        print(f"[CRASH_HANDLER] {message}")

@@ -349,9 +349,7 @@ class ScheduleTableModel(QAbstractTableModel):
 
                         if ho_val >= 60.0:
                             return QBrush(red_bg)
-                        elif 40.0 <= ho_val < 60.0:
-                            return QBrush(orange_bg)
-                        else:  # < 40%
+                        else:
                             return QBrush(green_bg)
 
                     current_check_idx += 1

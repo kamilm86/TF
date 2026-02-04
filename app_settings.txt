@@ -18,6 +18,7 @@ class AppSettings:
         self.WORK_LIKE_SYMBOLS = set()
         self.LOGGING_USERS_FILE = set()
         self.LOGGING_USERS_CONSOLE = set()
+        self.LOGGING_USERS_CRASH = set()  # Użytkownicy dla których logujemy crashe do pliku
         self.SUPER_LIDER_LOGINS = set()
         self.ENABLE_NOTIFICATION_CENTER = True
         self.SCHEDULE_CONTROL_ALL_MONTHS = False  # False = tylko nowy miesiąc, True = wszystkie miesiące
@@ -93,6 +94,10 @@ class AppSettings:
                 self.LOGGING_USERS_FILE = {user.strip().lower() for user in value.split(',') if user.strip()}
             elif key == 'LoggingUserConsole':
                 self.LOGGING_USERS_CONSOLE = {user.strip().lower() for user in value.split(',') if user.strip()}
+            elif key == 'LoggingUserCrash':
+                self.LOGGING_USERS_CRASH = {user.strip().lower() for user in value.split(',') if user.strip()}
+                from debug_utils import debug_print
+                debug_print(f"AppSettings: Logowanie crashów włączone dla: {self.LOGGING_USERS_CRASH}")
             elif key == 'SuperLiderLogins':
                 self.SUPER_LIDER_LOGINS = {login.strip().lower() for login in value.split(',') if login.strip()}
                 from debug_utils import debug_print

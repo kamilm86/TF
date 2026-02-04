@@ -33,13 +33,32 @@ class SessionManager:
         """
         Rejestruje nową sesję w bazie danych przy starcie aplikacji.
         Ustawia self.session_id na podstawie zwróconego ID z bazy.
+        
+        Dodatkowo oznacza "martwe" sesje tego użytkownika (zamknięte przez Menedżera Zadań
+        lub crash bez logowania) jako 'KilledOrCrash'.
         """
         conn = None
         try:
             conn = DatabaseConnector.get_connection()
             cursor = conn.cursor()
 
-            # Używamy dynamicznej nazwy tabeli z self.table_name
+            # KROK 1: Oznacz "martwe" sesje tego użytkownika
+            # Sesja jest "martwa" jeśli:
+            # - Nie ma SessionEnd (nie została poprawnie zamknięta)
+            # - LastHeartbeat był ponad 10 minut temu
+            sql_cleanup = f"""
+                UPDATE {self.table_name} 
+                SET SessionEnd = GETDATE(), ExitType = 'KilledOrCrash'
+                WHERE LoginWindows = ? 
+                  AND SessionEnd IS NULL 
+                  AND DATEDIFF(MINUTE, LastHeartbeat, GETDATE()) > 10
+            """
+            cursor.execute(sql_cleanup, (self.user_login,))
+            dead_sessions_count = cursor.rowcount
+            if dead_sessions_count > 0:
+                debug_print(f"SessionManager: Oznaczono {dead_sessions_count} martwych sesji jako 'KilledOrCrash'")
+
+            # KROK 2: Utwórz nową sesję
             sql = f"""
                 INSERT INTO {self.table_name} (LoginWindows, AppVersion, SessionStart, LastHeartbeat)
                 OUTPUT INSERTED.SessionId
@@ -90,12 +109,13 @@ class SessionManager:
             if conn:
                 conn.close()
 
-    def end_session(self, exit_type: str = "Normal") -> None:
+    def end_session(self, exit_type: str = "Normal", crash_info: Optional[str] = None) -> None:
         """
         Zamyka sesję w bazie danych, ustawiając czas zakończenia i typ wyjścia.
 
         Args:
-            exit_type (str): Typ zamknięcia ('Normal', 'UserExit', 'RemoteKill', 'Error').
+            exit_type (str): Typ zamknięcia ('Normal', 'UserExit', 'RemoteKill', 'Error', 'Crash', 'UnexpectedExit').
+            crash_info (str, optional): Szczegóły błędu/crashu (traceback). Max 4000 znaków.
         """
         if not self.session_id:
             return
@@ -105,8 +125,18 @@ class SessionManager:
             conn = DatabaseConnector.get_connection()
             cursor = conn.cursor()
 
+            # Podstawowe UPDATE - zawsze działa
             sql = f"UPDATE {self.table_name} SET SessionEnd = GETDATE(), ExitType = ? WHERE SessionId = ?"
             cursor.execute(sql, (exit_type, self.session_id))
+
+            # Próba zapisu crash_info (jeśli kolumna istnieje)
+            if crash_info:
+                try:
+                    sql_crash = f"UPDATE {self.table_name} SET CrashInfo = ? WHERE SessionId = ?"
+                    cursor.execute(sql_crash, (crash_info[:4000], self.session_id))
+                except Exception as crash_err:
+                    # Kolumna CrashInfo może nie istnieć - to OK, logujemy ostrzeżenie
+                    debug_print(f"SessionManager: Nie udało się zapisać CrashInfo (kolumna może nie istnieć): {crash_err}")
 
             conn.commit()
             debug_print(f"SessionManager: Sesja {self.session_id} zakończona (Typ: {exit_type}).")

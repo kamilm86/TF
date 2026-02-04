@@ -49,6 +49,7 @@ from preparation_thread import PreparationThread
 from loading_indicator import ModernLoadingIndicator
 from filter_select_dialog import FilterSelectDialog
 from session_manager import SessionManager
+from crash_handler import install_crash_handlers, set_session_manager, mark_clean_exit, install_qt_message_handler, set_crash_logging_enabled
 
 from absence_manager import AbsenceWorkflowManager
 from absence_manager import AbsenceWorkflowManager
@@ -3595,8 +3596,11 @@ class WorkScheduleWindow(QMainWindow):
         # Jeśli zawiera backslash (DOMENA\User), weź tylko to, co po prawej
         if '\\' in s:
             return s.split('\\')[1]
-
+        
         return s
+
+
+
 
     def on_db_notification(self, table_name: str, year: int, month: int, modifier: str):
         """
@@ -3703,43 +3707,22 @@ class WorkScheduleWindow(QMainWindow):
             self.background_checker.start()
             return
 
-        # PRZYPADEK B: Zmiana w zdarzeniach (Spotkania, Szkolenia, Nadgodziny) -> LEKKIE ODŚWIEŻANIE
-        if table_name in ['spotkania', 'szkolenia', 'nadgodziny']:
-            debug_print("Zmiana w tabelach zdarzeń. Uruchamiam lekkie odświeżanie.")
+        # PRZYPADEK B: Zmiana w zdarzeniach (Spotkania, Szkolenia, Nadgodziny) lub w grafiku (GrafikiPracy) -> ALERT (RĘCZNE ODŚWIEŻANIE)
+        if table_name in ['spotkania', 'szkolenia', 'nadgodziny', 'grafikipracy']:
+            # Zmiany w grafiku (symbole, godziny) oraz w zdarzeniach są ryzykowne do automatycznego odświeżania
+            # podczas edycji (szczególnie masowych zmian). Informujemy użytkownika zmianą koloru przycisku.
 
-            # Zapisujemy stan widoku (zaznaczenie, scroll), aby go nie stracić
-            view_state = self._save_view_state()
+            readable_tables = {
+                'grafikipracy': 'grafiku',
+                'spotkania': 'spotkań',
+                'szkolenia': 'szkoleń',
+                'nadgodziny': 'nadgodzin'
+            }
+            context_name = readable_tables.get(table_name, 'danych')
 
-            try:
-                # B1. Odśwież tylko cache zdarzeń w DataProvider (pobranie z bazy)
-                self.data_provider.refresh_events_data(year, month)
-
-                # B2. Wyczyść cache ikon w DataProvider (wymusi przeliczenie kółek/trójkątów)
-                self.data_provider.invalidate_icons_cache(year, month)
-
-                # B3. Odśwież dolną tabelę zdarzeń (jeśli coś jest zaznaczone)
-                if view_state and view_state.get('schedule_selection_ids'):
-                    self.on_selection_changed()
-
-                # B4. Przerysuj tabelę grafiku (zaciągnie nowe ikony z odświeżonego cache)
-                self.table.schedule_view.viewport().update()
-
-            finally:
-                # B5. Przywróć zaznaczenie (kluczowe dla komfortu pracy)
-                if view_state:
-                    self._restore_view_state(view_state)
-
-            self.statusBar().showMessage(f"Zaktualizowano dane zdarzeń (zmiana przez: {modifier})", 5000)
-            return
-
-        # PRZYPADEK C: Zmiana w samym grafiku (GrafikiPracy) -> ALERT (CIĘŻKIE ODŚWIEŻANIE)
-        if table_name == 'grafikipracy':
-            # Zmiany w grafiku (symbole, godziny) są ryzykowne do automatycznego odświeżania
-            # podczas edycji. Informujemy użytkownika zmianą koloru przycisku.
-
-            self.refresh_button.setText(f"Nowe dane grafiku!")
+            self.refresh_button.setText(f"Nowe dane!")
             self.refresh_button.setToolTip(
-                f"Użytkownik {modifier} wprowadził zmiany w grafiku. Kliknij, aby załadować.")
+                f"Użytkownik {modifier} wprowadził zmiany w tabeli {context_name}. Kliknij, aby załadować.")
 
             # Styl "alarmowy" (pomarańczowy)
             alert_style = AppStyles.get_alert_button_style(
@@ -5914,9 +5897,15 @@ class WorkScheduleWindow(QMainWindow):
             partial(self._on_async_data_loaded, filters_to_restore=filters_to_restore))
         self.loading_thread.error_occurred.connect(self._on_async_loading_failed)
         self.loading_thread.finished.connect(self.loading_indicator.hide)
-        self.loading_thread.finished.connect(self.loading_thread.deleteLater)
+        # Uwaga: NIE używamy deleteLater() - zamiast tego czyścimy referencję
+        self.loading_thread.finished.connect(self._clear_loading_thread_reference)
 
         self.loading_thread.start()
+
+    def _clear_loading_thread_reference(self):
+        """Czyści referencję do loading_thread po zakończeniu wątku."""
+        self.loading_thread = None
+
 
     def _on_async_data_loaded(self, data, filters_to_restore=None):
         """Obsługuje pomyślne załadowanie danych async."""
@@ -9126,9 +9115,31 @@ class WorkScheduleWindow(QMainWindow):
     def closeEvent(self, event):
         """Obsługuje zamknięcie aplikacji i zapisuje ustawienia."""
         debug_print("=== ZAMYKANIE APLIKACJI TEAMFLOW ===")
+        
+        # Oznacz czyste zamknięcie dla crash handlera
+        mark_clean_exit()
 
         try:
             # KROK 1: Zatrzymaj wątki w tle NAJPIERW (przed zapisem ustawień)
+            
+            # Zatrzymaj PreparationThread (loading_thread) jeśli działa
+            # Uwaga: loading_thread może być już usunięty przez deleteLater()
+            if hasattr(self, 'loading_thread') and self.loading_thread is not None:
+                try:
+                    # Sprawdź czy obiekt C++ jeszcze istnieje
+                    from shiboken6 import isValid
+                    if isValid(self.loading_thread) and self.loading_thread.isRunning():
+                        debug_print("Zatrzymywanie PreparationThread (loading_thread)...")
+                        self.loading_thread.cancel()
+                        if not self.loading_thread.wait(3000):  # Czekaj max 3 sekundy
+                            debug_print("PreparationThread nie zakończył się w czasie, wymuszam zakończenie")
+                            self.loading_thread.terminate()
+                            self.loading_thread.wait(1000)  # Daj czas na terminate
+                        debug_print("PreparationThread zatrzymany")
+                except (RuntimeError, ImportError):
+                    # Obiekt już usunięty lub shiboken niedostępny - ignoruj
+                    pass
+            
             # Zatrzymaj Service Broker Listener
             if hasattr(self, 'db_listener') and self.db_listener:
                 debug_print("Zatrzymywanie Service Broker Listener...")
@@ -9177,7 +9188,13 @@ class WorkScheduleWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Krok 0: Zainstaluj globalne handlery crashów NAJWCZEŚNIEJ JAK MOŻLIWE
+    install_crash_handlers()
+    
     app = QApplication(sys.argv)
+    
+    # Krok 0.5: Zainstaluj Qt Message Handler (musi być PO QApplication)
+    install_qt_message_handler()
 
     # Krok 1: Załaduj kluczowe ustawienia PRZED utworzeniem głównego okna
     if not load_all_app_settings():
@@ -9204,9 +9221,23 @@ if __name__ == "__main__":
     if app_settings.LOGGING_USERS_CONSOLE:
         log_to_console = current_windows_user in app_settings.LOGGING_USERS_CONSOLE
     setup_logging(log_to_file=log_to_file, log_to_console=log_to_console)
+    
+    # Krok 3.5: Skonfiguruj logowanie crashów
+    # Jeśli lista LOGGING_USERS_CRASH jest pusta, logujemy dla wszystkich
+    # Jeśli lista nie jest pusta, logujemy tylko dla użytkowników na liście
+    if app_settings.LOGGING_USERS_CRASH:
+        log_crashes = current_windows_user in app_settings.LOGGING_USERS_CRASH
+    else:
+        log_crashes = True  # Domyślnie loguj dla wszystkich jeśli lista pusta
+    set_crash_logging_enabled(log_crashes)
 
     # Krok 4: Utwórz główne okno (wczyta ustawienia użytkownika w __init__)
     window = WorkScheduleWindow()
+    
+    # Krok 4.5: Przekaż session_manager do crash handlera
+    if hasattr(window, 'session_manager') and window.session_manager:
+        set_session_manager(window.session_manager)
+        debug_print("Przekazano session_manager do crash handlera.")
 
     # === POCZĄTEK ZMIAN ===
     # Krok 5: Ustaw stan i rozmiar okna PRZED jego pokazaniem

@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (QMessageBox, QProgressDialog, QDialog, QVBoxLayou
                                QLabel, QTextEdit, QPushButton, QHBoxLayout, QWidget)
 from async_operations import CancelDelegationsThread
 from app_settings import app_settings
+from symbol_parser import parse_symbol  # Import parsera
+
 from ui_utils import show_confirmation_dialog, AppStyles  # Import stylów
 from debug_utils import debug_print, log_error
 
@@ -128,6 +130,26 @@ class AbsenceWorkflowManager(QObject):
             debug_print(f"[AbsenceManager] Symbol '{symbol}' NOT in absence symbols, skipping conflict check.")
             self._trigger_callback()
             return
+
+        # 1.5. Sprawdź i wyczyść symbol 'S' (wymóg Usera: UPDATE grafikipracy SET Symbol = ... ;S -> ;)
+        # Robimy to PRZED wykrywaniem konfliktów, aby baza była czysta.
+        cells_with_s_symbol = []
+        for cell in cells_data:
+            current_sym = cell.get('symbol', '')
+            parsed = parse_symbol(current_sym)
+            if parsed.get('special_symbol', '').upper() == 'S':
+                cells_with_s_symbol.append(cell)
+        
+        if cells_with_s_symbol:
+            debug_print(f"[AbsenceManager] Znaleziono {len(cells_with_s_symbol)} komórek z symbolem 'S'. Uruchamiam czyszczenie.")
+            if hasattr(self.parent, '_remove_s_symbol_directly'):
+                try:
+                    self.parent._remove_s_symbol_directly(cells_with_s_symbol)
+                except Exception as e:
+                    log_error(f"[AbsenceManager] Błąd podczas czyszczenia symbolu S: {e}")
+                    # Kontynuujemy mimo błędu, najwyżej użytkownik dostanie błąd później
+            else:
+                log_error("[AbsenceManager] Rodzic nie posiada metody _remove_s_symbol_directly!")
 
         debug_print(f"[AbsenceManager] Symbol '{symbol}' IS an absence symbol, detecting conflicts...")
         # 2. Wykryj konflikty (z doklejonymi danymi UI)
