@@ -42,7 +42,7 @@ from outlook_connector import create_outlook_email, create_email_from_template
 from teams_connector import open_teams_chat
 from async_operations import DelegationCanceler, LocationExceptionManager, BackgroundCheckerThread
 from ui_utils import (show_confirmation_dialog, show_error_dialog, 
-                        show_info_dialog, show_warning_dialog, create_clear_icon)
+                        show_info_dialog, show_warning_dialog, create_clear_icon, ScrollableDecisionDialog)
 from overtime_manager import OvertimeManager
 from schedule_change_processor import ScheduleChangeProcessor, ChangeType
 from preparation_thread import PreparationThread
@@ -186,7 +186,7 @@ class OvertimeItemDelegate(QStyledItemDelegate):
         # 4. Rysowanie - specjalne kolory dla wybranych symboli
         if text.upper() == 'NN':
             # NN (Nieobecność Nieusprawiedliwiona) - czerwone tło
-            painter.setBrush(QColor("#E74C3C"))  # Czerwony
+            painter.setBrush(QColor("#FF0000"))  # Czerwony (Bardziej widoczny)
             text_color = QColor(Qt.white)
         else:
             # Domyślnie białe tło
@@ -7415,13 +7415,21 @@ class WorkScheduleWindow(QMainWindow):
             return
 
         # Krok 1: Wyświetlaj dialog tylko, gdy jest to wymagane
+        # Krok 1: Wyświetlaj dialog tylko, gdy jest to wymagane
         if ask_for_confirmation:
             grouped_events = self._group_events_by_user_date(events_to_cancel)
-            delegations_info = self._prepare_delegations_description(grouped_events)
-            confirm_message = f"Czy na pewno chcesz odwołać następujące delegacje?<br>{delegations_info}"
+            delegations_info_txt = self._prepare_delegations_description(grouped_events)
+            # Zamieniamy nowe linie na <br> dla HTML
+            delegations_info_html = delegations_info_txt.replace("\n", "<br>")
 
-            reply = show_confirmation_dialog(self, "Potwierdzenie odwołania delegacji", confirm_message)
-            if reply != QMessageBox.Yes:
+            intro_text = "Czy na pewno chcesz odwołać następujące delegacje?"
+            question_text = "Wybrane delegacje zostaną automatycznie odwołane."
+
+            dialog = ScrollableDecisionDialog(self, "Potwierdzenie odwołania delegacji", 
+                                              intro_text, delegations_info_html, question_text,
+                                              yes_text="Tak, odwołaj", no_text="Anuluj")
+            
+            if dialog.exec() != QDialog.Accepted:
                 return
 
         # Krok 2: Wykonaj operacje

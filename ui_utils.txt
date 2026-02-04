@@ -256,3 +256,81 @@ def create_settings_icon(color: QColor) -> QIcon:
     painter.drawEllipse(6, 6, 4, 4)  # Kropka w środku
     painter.end()
     return QIcon(pixmap)
+
+
+class ScrollableDecisionDialog(QDialog):
+    """
+    Niestandardowe okno dialogowe z przewijaną listą szczegółów.
+    Zastępuje ScrollableConflictDialog z absence_manager.py i naprawia okno odwołania delegacji.
+    """
+
+    def __init__(self, parent, title, intro_text, details_html, question_text, yes_text="Tak", no_text="Anuluj"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(500, 400)  # Domyślny rozmiar
+
+        # --- Pobieranie stylów ---
+        is_dark = True
+        if parent:
+            if hasattr(parent, 'is_dark_theme'):
+                is_dark = parent.is_dark_theme
+            elif hasattr(parent, 'parent_widget') and hasattr(parent.parent_widget, 'is_dark_theme'):
+                is_dark = parent.parent_widget.is_dark_theme
+
+        theme = "dark" if is_dark else "light"
+
+        # Aplikujemy style okna
+        try:
+            dialog_style = AppStyles.get_dialog_style(theme)
+            self.setStyleSheet(dialog_style)
+        except Exception:
+            pass
+
+        layout = QVBoxLayout(self)
+
+        # 1. Tekst wprowadzający
+        lbl_intro = QLabel(intro_text)
+        lbl_intro.setWordWrap(True)
+        f = lbl_intro.font()
+        f.setBold(True)
+        lbl_intro.setFont(f)
+        layout.addWidget(lbl_intro)
+
+        # 2. Przewijalny obszar ze szczegółami
+        self.details_box = QTextEdit()
+        self.details_box.setReadOnly(True)
+        self.details_box.setHtml(details_html)
+        self.details_box.setStyleSheet("QTextEdit { border: 1px solid #555; background-color: #2b2b2b; color: #e0e0e0; padding: 5px; }")
+        if theme == "light":
+            self.details_box.setStyleSheet(
+                "QTextEdit { border: 1px solid #ccc; background-color: #f5f5f5; color: black; padding: 5px; }")
+
+        layout.addWidget(self.details_box)
+
+        # 3. Pytanie końcowe
+        if question_text:
+            lbl_question = QLabel(question_text)
+            lbl_question.setWordWrap(True)
+            lbl_question.setAlignment(Qt.AlignCenter)
+            layout.addWidget(lbl_question)
+
+        # 4. Przyciski
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        self.btn_yes = QPushButton(yes_text)
+        self.btn_no = QPushButton(no_text)
+
+        try:
+            btn_style = AppStyles.get_button_style(theme)
+            self.btn_yes.setStyleSheet(btn_style)
+            self.btn_no.setStyleSheet(btn_style)
+        except:
+            pass
+
+        self.btn_yes.clicked.connect(self.accept)
+        self.btn_no.clicked.connect(self.reject)
+
+        btn_layout.addWidget(self.btn_yes)
+        btn_layout.addWidget(self.btn_no)
+        layout.addLayout(btn_layout)

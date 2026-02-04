@@ -137,19 +137,12 @@ class AbsenceWorkflowManager(QObject):
         for cell in cells_data:
             current_sym = cell.get('symbol', '')
             parsed = parse_symbol(current_sym)
-            if parsed.get('special_symbol', '').upper() == 'S':
+            if (parsed.get('special_symbol') or '').upper() == 'S':
                 cells_with_s_symbol.append(cell)
         
+        self._cells_to_clean_s = cells_with_s_symbol
         if cells_with_s_symbol:
-            debug_print(f"[AbsenceManager] Znaleziono {len(cells_with_s_symbol)} komórek z symbolem 'S'. Uruchamiam czyszczenie.")
-            if hasattr(self.parent, '_remove_s_symbol_directly'):
-                try:
-                    self.parent._remove_s_symbol_directly(cells_with_s_symbol)
-                except Exception as e:
-                    log_error(f"[AbsenceManager] Błąd podczas czyszczenia symbolu S: {e}")
-                    # Kontynuujemy mimo błędu, najwyżej użytkownik dostanie błąd później
-            else:
-                log_error("[AbsenceManager] Rodzic nie posiada metody _remove_s_symbol_directly!")
+            debug_print(f"[AbsenceManager] Znaleziono {len(cells_with_s_symbol)} komórek z symbolem 'S'. Oznaczono do usunięcia PO potwierdzeniu.")
 
         debug_print(f"[AbsenceManager] Symbol '{symbol}' IS an absence symbol, detecting conflicts...")
         # 2. Wykryj konflikty (z doklejonymi danymi UI)
@@ -161,8 +154,10 @@ class AbsenceWorkflowManager(QObject):
                 # Jeśli są tylko ostrzeżenia (np. o urlopie), używamy zwykłego dialogu
                 full_msg = f"{warning_msg}<br><br>Czy kontynuować?"
                 if show_confirmation_dialog(self.parent, "Potwierdzenie", full_msg, QMessageBox.Yes) == QMessageBox.Yes:
+                    self._perform_s_cleanup_if_needed()
                     self._trigger_callback()
             else:
+                self._perform_s_cleanup_if_needed()
                 self._trigger_callback()
         else:
             # Pokaż pogrupowane szczegóły w nowym oknie
@@ -309,6 +304,9 @@ class AbsenceWorkflowManager(QObject):
         if dialog.exec() != QDialog.Accepted:
             return  # Anulowano
 
+        # 3b. Po potwierdzeniu - czyścimy symbol S
+        self._perform_s_cleanup_if_needed()
+
         # 4. Jeśli OK -> Uruchom proces usuwania przez głównego menedżera (DelegationCanceler)
         # Dzięki temu korzystamy ze sprawdzonej logiki odświeżania UI i ikon.
         
@@ -342,3 +340,14 @@ class AbsenceWorkflowManager(QObject):
             except Exception as e:
                 log_error(f"AbsenceManager: Błąd callback: {e}")
                 QMessageBox.critical(self.parent, "Błąd", f"Błąd wstawiania:\n{e}")
+
+    def _perform_s_cleanup_if_needed(self):
+        """Pomocnicza metoda do czyszczenia symbolu S, wywoływana po potwierdzeniu."""
+        if hasattr(self, '_cells_to_clean_s') and self._cells_to_clean_s:
+            debug_print(f"[AbsenceManager] Wykonuję opóźnione czyszczenie symbolu S ({len(self._cells_to_clean_s)} komórek).")
+            if hasattr(self.parent, '_remove_s_symbol_directly'):
+                try:
+                    self.parent._remove_s_symbol_directly(self._cells_to_clean_s)
+                except Exception as e:
+                    log_error(f"[AbsenceManager] Błąd podczas czyszczenia symbolu S: {e}")
+            self._cells_to_clean_s = []  # Wyczyść listę po wykonaniu

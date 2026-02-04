@@ -32,17 +32,32 @@ class PreparationThread(QThread):
 
             # Używamy ThreadPoolExecutor do równoległego pobierania danych
             # Dzięki temu długie zapytanie o grafik nie blokuje pobierania zdarzeń
+            # Używamy ThreadPoolExecutor do równoległego pobierania danych
+            # Dzięki temu długie zapytanie o grafik nie blokuje pobierania zdarzeń
+            debug_print(f"[PERFORMANCE] Start parallel fetch for {self.year}-{self.month}")
+            
             with ThreadPoolExecutor(max_workers=2) as executor:
+                # Uruchamiamy CAŁKOWICIE NIEZALEŻNE pobierania (każde z własnym połączeniem)
                 future_schedule = executor.submit(
-                    self.data_provider._get_or_load_monthly_data,
-                    self.year, self.month, self.grupa, self.funkcja, use_cache=False
+                    self.data_provider.fetch_schedule_standalone,
+                    self.year, self.month, self.grupa, self.funkcja
+                )
+                future_events = executor.submit(
+                    self.data_provider.fetch_events_standalone,
+                    self.year, self.month
                 )
 
-                # Pobieranie prognozy też można by tu dodać, jeśli jest wolne
-                # future_forecast = ...
+                # Oczekiwanie na wyniki (oba wątki pracują jednocześnie)
+                # result() zablokuje wykonanie do czasu zakończenia danego zadania
+                schedule_data = future_schedule.result()
+                events_data = future_events.result()
 
-                # Oczekiwanie na wyniki
-                container = future_schedule.result()
+            if self.is_cancelled(): return
+
+            # Składamy wyniki w całość i zapisujemy do cache
+            container = self.data_provider.assemble_and_cache_data(
+                self.year, self.month, schedule_data, events_data
+            )
 
             if self.is_cancelled(): return
 

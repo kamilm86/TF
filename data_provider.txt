@@ -300,6 +300,74 @@ class DataProvider(QObject):
             if conn:
                 conn.close()
 
+    # --- NOWE METODY DO RÓWNOLEGŁEGO POBIERANIA DANYCH ---
+
+    def fetch_schedule_standalone(self, year: int, month: int, grupa: int, funkcja: int) -> List[Dict]:
+        """
+        Pobiera dane grafiku używając WŁASNEGO, NIEZALEŻNEGO połączenia do bazy.
+        Metoda bezpieczna dla wątków (thread-safe).
+        """
+        conn = None
+        try:
+            conn = self.db_connector.get_connection()
+            debug_print(f"[THREAD-DB] Pobieranie grafiku STARTED (ConnID: {id(conn)})")
+            data = self._fetch_schedule_data(year, month, grupa, funkcja, conn)
+            debug_print(f"[THREAD-DB] Pobieranie grafiku DONE (Rows: {len(data)})")
+            return data
+        finally:
+            if conn:
+                conn.close()
+
+    def fetch_events_standalone(self, year: int, month: int) -> List[Dict]:
+        """
+        Pobiera dane zdarzeń używając WŁASNEGO, NIEZALEŻNEGO połączenia do bazy.
+        Metoda bezpieczna dla wątków (thread-safe).
+        """
+        conn = None
+        try:
+            conn = self.db_connector.get_connection()
+            debug_print(f"[THREAD-DB] Pobieranie zdarzeń STARTED (ConnID: {id(conn)})")
+            data = self._fetch_events_data(year, month, conn)
+            debug_print(f"[THREAD-DB] Pobieranie zdarzeń DONE (Rows: {len(data)})")
+            return data
+        finally:
+            if conn:
+                conn.close()
+
+    def assemble_and_cache_data(self, year: int, month: int, schedule_data: List[Dict], events_data: List[Dict]) -> Optional[MonthlyDataContainer]:
+        """
+        Składa pobrane równolegle dane w gotowy kontener i zapisuje w cache.
+        """
+        try:
+            cache_key = (year, month)
+            
+            # Budowanie cache i przetwarzanie (operacje CPU)
+            events_cache = self._build_events_cache(events_data)
+            processed_data_base = self._build_processed_data_without_icons(schedule_data)
+
+            container = MonthlyDataContainer(
+                schedule_data=schedule_data,
+                events_data=events_data,
+                processed_data_base=processed_data_base,
+                events_cache=events_cache,
+                last_updated=time.time()
+            )
+
+            # Zapis do cache (operacja atomowa w Pythonie dla słownika)
+            self.monthly_cache[cache_key] = container
+            
+            # Ustawiamy parametry bieżące
+            self._current_year = year
+            self._current_month = month
+            
+            debug_print(f"DataProvider: Złożono i zapisano dane (parallel) dla {year}-{month}.")
+            return container
+        except Exception as e:
+            log_error(f"DataProvider: Błąd podczas składania danych: {e}")
+            return None
+
+    # -----------------------------------------------------
+
     def _get_or_load_monthly_data(self, year: int, month: int, grupa: int, funkcja: int, use_cache: bool = True) -> \
             Optional[MonthlyDataContainer]:
         self._current_year = year
@@ -315,33 +383,21 @@ class DataProvider(QObject):
 
         conn = None
         try:
-            # --- NOWA LOGIKA: Otwórz jedno połączenie na całą operację ---
+            # --- ZMIANA: Otwórz jedno połączenie na całą operację (wersja sekwencyjna) ---
             conn = self.db_connector.get_connection()
 
             # Przekaż istniejące połączenie do metod pobierających dane
             schedule_data = self._fetch_schedule_data(year, month, grupa, funkcja, conn)
             events_data = self._fetch_events_data(year, month, conn)
-
-            # --- POCZĄTEK POPRAWKI ---
-            # Ta logika została przypadkowo usunięta. Przywracamy ją.
-            events_cache = self._build_events_cache(events_data)
-            processed_data_base = self._build_processed_data_without_icons(schedule_data)
-
-            container = MonthlyDataContainer(
-                schedule_data=schedule_data,
-                events_data=events_data,
-                processed_data_base=processed_data_base,
-                events_cache=events_cache,
-                last_updated=time.time()
-            )
-
-            self.monthly_cache[cache_key] = container
-            debug_print(f"DataProvider: Stworzono i zapisano w cache nowy kontener dla {year}-{month}.")
-            return container
-            # --- KONIEC POPRAWKI ---
+            
+            # --- Używamy wspólnej metody do budowania kontenera ---
+            # Dzięki temu unikamy duplikacji logiki
+            
+            # Uwaga: assemble_and_cache_data zapisuje do cache i ustawia self._current_*,
+            # więc nie musimy tego robić ręcznie tutaj.
+            return self.assemble_and_cache_data(year, month, schedule_data, events_data)
 
         finally:
-            # --- NOWA LOGIKA: Zamknij połączenie na samym końcu ---
             if conn:
                 conn.close()
 
