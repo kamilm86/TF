@@ -12,7 +12,9 @@ from config import SQL_OBJECTS
 from debug_utils import log_error, debug_print
 
 # Nowe importy
-from async_operations import SuggestionImportThread, SuggestionImportOutThread
+from async_operations import (SuggestionImportThread, SuggestionImportOutThread, 
+                              VacationPlanImportThread, VacationPlanImportOutThread,
+                              PublishScheduleThread)
 from error_display_dialog import ErrorDisplayDialog
 
 
@@ -77,6 +79,8 @@ class ScheduleControlDialog(QDialog):
         self.blocking_date = None
 
         self.import_thread = None
+        self.vacation_import_thread = None  # Oddzielny wątek dla planów urlopowych
+        self.publish_thread = None  # Wątek dla publikacji grafiku
         self.error_dialog = None
         # ZMIANA: Usunięto self.last_import_errors - nie jest już potrzebne
         self.progress_dialog = None
@@ -242,7 +246,11 @@ class ScheduleControlDialog(QDialog):
             calendar.setStyleSheet(calendar_style)
 
     def get_vacation_plans(self):
-        """Obsługuje pobieranie planów urlopowych."""
+        """Rozpoczyna asynchroniczny import planów urlopowych."""
+        if self.vacation_import_thread:
+            QMessageBox.warning(self, "Import w toku", "Import planów urlopowych jest już uruchomiony.")
+            return
+
         reply = show_confirmation_dialog(self, "Potwierdzenie",
                                          "Czy na pewno chcesz pobrać plany urlopowe dla wszystkich? Może to spowodować nadpisanie wprowadzonych już danych.",
                                          default_button=QMessageBox.No)
@@ -250,17 +258,50 @@ class ScheduleControlDialog(QDialog):
         if reply == QMessageBox.No:
             return
 
-        try:
-            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, 1, 0"
-            conn = DatabaseConnector.get_connection()
-            conn.execute(sql)
-            conn.commit()
-            conn.close()
-            QMessageBox.information(self, "Sukces", "Plany urlopowe zostały pobrane.")
+        debug_print(f"Uruchamianie VacationPlanImportThread dla {self.year}-{self.month}")
+
+        self.progress_dialog = QProgressDialog("Importowanie planów urlopowych...", "Anuluj", 0, 0, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        self.vacation_import_thread = VacationPlanImportThread(self.year, self.month)
+        self.vacation_import_thread.finished.connect(self._on_vacation_import_finished)
+        self.vacation_import_thread.error_occurred.connect(self._on_vacation_import_error)
+        self.progress_dialog.canceled.connect(self.vacation_import_thread.cancel)
+
+        self.vacation_import_thread.start()
+        self.progress_dialog.show()
+
+    def _on_vacation_import_finished(self, success: bool):
+        """Callback po zakończeniu wątku importu planów urlopowych."""
+        debug_print(f"VacationPlanImportThread zakończony. Sukces: {success}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.vacation_import_thread:
+            self.vacation_import_thread.deleteLater()
+            self.vacation_import_thread = None
+
+        if success:
             self.data_refresh_needed.emit()
-        except Exception as e:
-            QMessageBox.critical(self, "Błąd Bazy Danych",
-                                 f"Wystąpił błąd podczas pobierania planów urlopowych:<br>{e}")
+            QMessageBox.information(self, "Sukces", "Plany urlopowe zostały pobrane.")
+
+    def _on_vacation_import_error(self, error_message: str):
+        """Callback po krytycznym błędzie wątku importów urlopowych."""
+        debug_print(f"VacationPlanImportThread zgłosił błąd krytyczny: {error_message}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.vacation_import_thread:
+            self.vacation_import_thread.deleteLater()
+            self.vacation_import_thread = None
+
+        QMessageBox.critical(self, "Błąd krytyczny importu",
+                             f"Wystąpił błąd krytyczny podczas importu planów urlopowych:\n{error_message}")
 
     def _execute_procedure(self, sql_query):
         """Pomocnicza metoda do wykonywania zapytań."""
@@ -418,20 +459,81 @@ class ScheduleControlDialog(QDialog):
             QMessageBox.critical(self, "Błąd Bazy Danych", f"Wystąpił błąd podczas zmiany statusu sugestii:<br>{e}")
 
     def publish_schedule(self):
-        sql = f"exec {SQL_OBJECTS['p_publikowaniegrafiku']} {self.year}, {self.month}, '{self.login_windows}', 1"
-        if self._execute_procedure(sql):
-            QMessageBox.information(self, "Sukces", "Grafik został opublikowany.")
+        """Rozpoczyna asynchroniczną publikację grafiku."""
+        if self.publish_thread:
+            QMessageBox.warning(self, "Operacja w toku", "Operacja publikacji jest już uruchomiona.")
+            return
+
+        debug_print(f"Uruchamianie PublishScheduleThread (publikacja) dla {self.year}-{self.month}")
+
+        self.progress_dialog = QProgressDialog("Publikowanie grafiku...", "Anuluj", 0, 0, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        self.publish_thread = PublishScheduleThread(self.year, self.month, self.login_windows, 1)
+        self.publish_thread.finished.connect(self._on_publish_finished)
+        self.publish_thread.error_occurred.connect(self._on_publish_error)
+        self.progress_dialog.canceled.connect(self.publish_thread.cancel)
+
+        self.publish_thread.start()
+        self.progress_dialog.show()
+
+    def unpublish_schedule(self):
+        """Rozpoczyna asynchroniczne cofnięcie publikacji grafiku."""
+        if self.publish_thread:
+            QMessageBox.warning(self, "Operacja w toku", "Operacja publikacji jest już uruchomiona.")
+            return
+
+        debug_print(f"Uruchamianie PublishScheduleThread (cofnięcie) dla {self.year}-{self.month}")
+
+        self.progress_dialog = QProgressDialog("Cofanie publikacji grafiku...", "Anuluj", 0, 0, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        self.publish_thread = PublishScheduleThread(self.year, self.month, self.login_windows, 0)
+        self.publish_thread.finished.connect(self._on_publish_finished)
+        self.publish_thread.error_occurred.connect(self._on_publish_error)
+        self.progress_dialog.canceled.connect(self.publish_thread.cancel)
+
+        self.publish_thread.start()
+        self.progress_dialog.show()
+
+    def _on_publish_finished(self, success: bool, mode: int):
+        """Callback po zakończeniu wątku publikacji grafiku."""
+        action = "publikacji" if mode == 1 else "cofnięcia publikacji"
+        debug_print(f"PublishScheduleThread ({action}) zakończony. Sukces: {success}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.publish_thread:
+            self.publish_thread.deleteLater()
+            self.publish_thread = None
+
+        if success:
+            if mode == 1:
+                QMessageBox.information(self, "Sukces", "Grafik został opublikowany.")
+            else:
+                QMessageBox.information(self, "Sukces", "Publikacja grafiku została cofnięta.")
             self.load_initial_status()
             self.data_provider.clear_publish_status_cache(self.year, self.month)
             self.data_refresh_needed.emit()
 
-    def unpublish_schedule(self):
-        sql = f"exec {SQL_OBJECTS['p_publikowaniegrafiku']} {self.year}, {self.month}, '{self.login_windows}', 0"
-        if self._execute_procedure(sql):
-            QMessageBox.information(self, "Sukces", "Publikacja grafiku została cofnięta.")
-            self.load_initial_status()
-            self.data_provider.clear_publish_status_cache(self.year, self.month)
-            self.data_refresh_needed.emit()
+    def _on_publish_error(self, error_message: str):
+        """Callback po krytycznym błędzie wątku publikacji."""
+        debug_print(f"PublishScheduleThread zgłosił błąd krytyczny: {error_message}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.publish_thread:
+            self.publish_thread.deleteLater()
+            self.publish_thread = None
+
+        QMessageBox.critical(self, "Błąd krytyczny",
+                             f"Wystąpił błąd krytyczny podczas operacji publikacji:\n{error_message}")
 
     # --- NOWE METODY OBSŁUGI IMPORTU SUGESTII ---
 
@@ -583,9 +685,10 @@ class SuggestionsOutDialog(QDialog):
         self.user_app_id = user_app_id
         self.login_windows = login_windows
 
-        # Referencja do okna błędów i wątku importu
+        # Referencja do okna błędów i wątków importu
         self.error_dialog = None
         self.import_thread = None
+        self.vacation_import_thread = None  # Oddzielny wątek dla planów urlopowych
         self.progress_dialog = None
 
         self.setWindowTitle("Sugestie konsultantów out")
@@ -746,7 +849,11 @@ class SuggestionsOutDialog(QDialog):
                              f"Wystąpił błąd krytyczny podczas importu sugestii:\n{error_message}")
 
     def _get_vacation_plans(self):
-        """Pobiera plany urlopowe dla zaznaczonych grup."""
+        """Rozpoczyna asynchroniczny import planów urlopowych OUT."""
+        if self.vacation_import_thread:
+            QMessageBox.warning(self, "Import w toku", "Import planów urlopowych jest już uruchomiony.")
+            return
+
         logins = self._get_selected_groups_logins()
         if not logins:
             return
@@ -758,19 +865,50 @@ class SuggestionsOutDialog(QDialog):
         if reply == QMessageBox.No:
             return
 
-        try:
-            params_str = ", ".join([f"'{login}'" for login in logins])
-            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, 2, 0, {params_str}"
-            conn = DatabaseConnector.get_connection()
-            conn.execute(sql)
-            conn.commit()
-            conn.close()
-            QMessageBox.information(self, "Sukces", "Plany urlopowe zostały pobrane.")
+        debug_print(f"Uruchamianie VacationPlanImportOutThread dla {self.year}-{self.month}, grupy: {logins}")
+
+        self.progress_dialog = QProgressDialog("Importowanie planów urlopowych...", "Anuluj", 0, 0, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setWindowTitle("Przetwarzanie")
+
+        self.vacation_import_thread = VacationPlanImportOutThread(self.year, self.month, logins)
+        self.vacation_import_thread.finished.connect(self._on_vacation_import_finished)
+        self.vacation_import_thread.error_occurred.connect(self._on_vacation_import_error)
+        self.progress_dialog.canceled.connect(self.vacation_import_thread.cancel)
+
+        self.vacation_import_thread.start()
+        self.progress_dialog.show()
+
+    def _on_vacation_import_finished(self, success: bool):
+        """Callback po zakończeniu wątku importu planów urlopowych OUT."""
+        debug_print(f"VacationPlanImportOutThread zakończony. Sukces: {success}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.vacation_import_thread:
+            self.vacation_import_thread.deleteLater()
+            self.vacation_import_thread = None
+
+        if success:
             self.data_refresh_needed.emit()
-        except Exception as e:
-            log_error(f"Błąd pobierania planów urlopowych OUT: {e}", exception=e)
-            QMessageBox.critical(self, "Błąd Bazy Danych",
-                                 f"Wystąpił błąd podczas pobierania planów urlopowych:<br>{e}")
+            QMessageBox.information(self, "Sukces", "Plany urlopowe zostały pobrane.")
+
+    def _on_vacation_import_error(self, error_message: str):
+        """Callback po krytycznym błędzie wątku importu planów urlopowych OUT."""
+        debug_print(f"VacationPlanImportOutThread zgłosił błąd krytyczny: {error_message}")
+
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+
+        if self.vacation_import_thread:
+            self.vacation_import_thread.deleteLater()
+            self.vacation_import_thread = None
+
+        QMessageBox.critical(self, "Błąd krytyczny importu",
+                             f"Wystąpił błąd krytyczny podczas importu planów urlopowych:\n{error_message}")
 
     def _show_historical_logs(self):
         """Pobiera i wyświetla historyczne logi błędów importu."""

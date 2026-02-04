@@ -160,6 +160,203 @@ class SuggestionImportOutThread(QThread):
         self._is_cancelled = True
         debug_print("Otrzymano żądanie anulowania importu sugestii OUT.")
 
+
+class VacationPlanImportThread(QThread):
+    """
+    Wątek roboczy do asynchronicznego importowania planów urlopowych IN
+    z procedury p_importujplanyurlopowe.
+    """
+    finished = Signal(bool)
+    error_occurred = Signal(str)
+
+    def __init__(self, year, month, parent=None):
+        super().__init__(parent)
+        self.year = year
+        self.month = month
+        self._is_cancelled = False
+
+    def run(self):
+        conn = None
+        cursor = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            conn.autocommit = True
+            conn.timeout = 0
+            debug_print(f"Ustawiono conn.timeout = 0 dla VacationPlanImportThread.")
+
+            cursor = conn.cursor()
+
+            # Parametry: rok, miesiac, tryb (1=IN), flaga (0)
+            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, 1, 0"
+            debug_print(f"Wywołuję VacationPlanImportThread: {sql}")
+
+            cursor.execute(sql)
+            
+            while cursor.nextset():
+                pass
+
+            if not self._is_cancelled:
+                self.finished.emit(True)
+
+        except pyodbc.Error as e:
+            if "Operation canceled" in str(e) or self._is_cancelled:
+                log_warning(f"Import planów urlopowych IN anulowany przez użytkownika.")
+                self.finished.emit(False)
+            else:
+                log_error(f"Błąd SQL w VacationPlanImportThread: {e}", exception=e)
+                if not self._is_cancelled:
+                    self.error_occurred.emit(f"Błąd bazy danych: {e}")
+        except Exception as e:
+            log_error(f"Krytyczny błąd w VacationPlanImportThread: {e}", exception=e)
+            if not self._is_cancelled:
+                self.error_occurred.emit(f"Błąd aplikacji: {e}")
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.autocommit = False
+                conn.timeout = 30
+                conn.close()
+                debug_print("Przywrócono domyślny stan połączenia (VacationPlan IN).")
+
+    def cancel(self):
+        self._is_cancelled = True
+        debug_print("Otrzymano żądanie anulowania importu planów urlopowych IN.")
+
+
+class VacationPlanImportOutThread(QThread):
+    """
+    Wątek roboczy do asynchronicznego importowania planów urlopowych OUT
+    z procedury p_importujplanyurlopowe.
+    """
+    finished = Signal(bool)
+    error_occurred = Signal(str)
+
+    def __init__(self, year, month, logins, parent=None):
+        super().__init__(parent)
+        self.year = year
+        self.month = month
+        self.logins = logins  # lista loginów przełożonych
+        self._is_cancelled = False
+
+    def run(self):
+        conn = None
+        cursor = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            conn.autocommit = True
+            conn.timeout = 0
+            debug_print(f"Ustawiono conn.timeout = 0 dla VacationPlanImportOutThread.")
+
+            cursor = conn.cursor()
+
+            # Parametry: rok, miesiac, tryb (2=OUT), flaga (0), grupa1, grupa2, ...
+            params_str = ", ".join([f"'{login}'" for login in self.logins])
+            sql = f"EXEC {SQL_OBJECTS['p_importujplanyurlopowe']} {self.year}, {self.month}, 2, 0, {params_str}"
+            debug_print(f"Wywołuję VacationPlanImportOutThread: {sql}")
+
+            cursor.execute(sql)
+            
+            while cursor.nextset():
+                pass
+
+            if not self._is_cancelled:
+                self.finished.emit(True)
+
+        except pyodbc.Error as e:
+            if "Operation canceled" in str(e) or self._is_cancelled:
+                log_warning(f"Import planów urlopowych OUT anulowany przez użytkownika.")
+                self.finished.emit(False)
+            else:
+                log_error(f"Błąd SQL w VacationPlanImportOutThread: {e}", exception=e)
+                if not self._is_cancelled:
+                    self.error_occurred.emit(f"Błąd bazy danych: {e}")
+        except Exception as e:
+            log_error(f"Krytyczny błąd w VacationPlanImportOutThread: {e}", exception=e)
+            if not self._is_cancelled:
+                self.error_occurred.emit(f"Błąd aplikacji: {e}")
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.autocommit = False
+                conn.timeout = 30
+                conn.close()
+                debug_print("Przywrócono domyślny stan połączenia (VacationPlan OUT).")
+
+    def cancel(self):
+        self._is_cancelled = True
+        debug_print("Otrzymano żądanie anulowania importu planów urlopowych OUT.")
+
+
+class PublishScheduleThread(QThread):
+    """
+    Wątek roboczy do asynchronicznej publikacji/cofnięcia publikacji grafiku
+    z procedury p_publikowaniegrafiku.
+    """
+    finished = Signal(bool, int)  # sukces, tryb (1=publikacja, 0=cofnięcie)
+    error_occurred = Signal(str)
+
+    def __init__(self, year, month, login_windows, mode, parent=None):
+        """
+        Args:
+            mode: 1 = publikacja, 0 = cofnięcie publikacji
+        """
+        super().__init__(parent)
+        self.year = year
+        self.month = month
+        self.login_windows = login_windows
+        self.mode = mode  # 1 = publikacja, 0 = cofnięcie
+        self._is_cancelled = False
+
+    def run(self):
+        conn = None
+        cursor = None
+        try:
+            conn = DatabaseConnector.get_connection()
+            conn.autocommit = True
+            conn.timeout = 0
+            action = "publikacji" if self.mode == 1 else "cofania publikacji"
+            debug_print(f"Ustawiono conn.timeout = 0 dla PublishScheduleThread ({action}).")
+
+            cursor = conn.cursor()
+
+            sql = f"EXEC {SQL_OBJECTS['p_publikowaniegrafiku']} {self.year}, {self.month}, '{self.login_windows}', {self.mode}"
+            debug_print(f"Wywołuję PublishScheduleThread: {sql}")
+
+            cursor.execute(sql)
+            
+            while cursor.nextset():
+                pass
+
+            if not self._is_cancelled:
+                self.finished.emit(True, self.mode)
+
+        except pyodbc.Error as e:
+            if "Operation canceled" in str(e) or self._is_cancelled:
+                log_warning(f"Publikacja grafiku anulowana przez użytkownika.")
+                self.finished.emit(False, self.mode)
+            else:
+                log_error(f"Błąd SQL w PublishScheduleThread: {e}", exception=e)
+                if not self._is_cancelled:
+                    self.error_occurred.emit(f"Błąd bazy danych: {e}")
+        except Exception as e:
+            log_error(f"Krytyczny błąd w PublishScheduleThread: {e}", exception=e)
+            if not self._is_cancelled:
+                self.error_occurred.emit(f"Błąd aplikacji: {e}")
+        finally:
+            if cursor:
+                cursor.close()
+            if conn:
+                conn.autocommit = False
+                conn.timeout = 30
+                conn.close()
+                debug_print("Przywrócono domyślny stan połączenia (PublishSchedule).")
+
+    def cancel(self):
+        self._is_cancelled = True
+        debug_print("Otrzymano żądanie anulowania publikacji grafiku.")
+
 class LocationExceptionThread(QThread):
     """Wątek roboczy do zarządzania wyjątkami lokalizacyjnymi w tle."""
     progress_updated = Signal(int)
