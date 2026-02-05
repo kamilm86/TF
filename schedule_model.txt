@@ -94,6 +94,31 @@ class ScheduleTableModel(QAbstractTableModel):
         # BUDOWANIE STRUKTURY NA KOŃCU __INIT__
         self._update_column_structure()
         self._icons_cache = {}
+        # OPTYMALIZACJA: Cache dla pędzli (QBrush)
+        self._brush_cache = {}
+
+    def _get_cached_brush(self, color_input):
+        """Pomocnicza metoda do cache'owania QBrush."""
+        if not color_input:
+            return None
+            
+        # Jeśli to już jest QBrush, zwróć go (ale nie cache'uj, bo niekluczowalne)
+        if isinstance(color_input, QBrush):
+            return color_input
+            
+        # Klucz do cache
+        if isinstance(color_input, QColor):
+            key = color_input.name()
+        else:
+            key = str(color_input)
+            
+        if key in self._brush_cache:
+            return self._brush_cache[key]
+            
+        # Utwórz i dodaj do cache
+        brush = QBrush(QColor(color_input))
+        self._brush_cache[key] = brush
+        return brush
 
     def set_column_map(self, column_map: dict):
         self.column_map = column_map
@@ -101,6 +126,7 @@ class ScheduleTableModel(QAbstractTableModel):
 
     def set_row_colors(self, colors: dict) -> None:
         self._row_colors = colors if colors is not None else {}
+        self._brush_cache.clear()  # Czyścimy cache przy zmianie kolorów
         if self.rowCount() > 0:
             self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
 
@@ -190,17 +216,31 @@ class ScheduleTableModel(QAbstractTableModel):
         if role == Qt.ForegroundRole:
             if not is_employee_column:
                 bg_color_hex = day_data.get('_bg_color_hex')
+                # OPTYMALIZACJA: Użyj cache
                 if bg_color_hex:
+                    # Logika luminance - można też cachować wyliczony kolor tekstu dla danego tła!
+                    # Dla uproszczenia na razie cache brushes
+                    cached_key = f"fg_{bg_color_hex}"
+                    if cached_key in self._brush_cache:
+                        return self._brush_cache[cached_key]
+                        
                     color = QColor(bg_color_hex)
                     luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
-                    return QBrush(QColor(Qt.GlobalColor.white if luminance < 128 else Qt.GlobalColor.black))
+                    final_color = Qt.GlobalColor.white if luminance < 128 else Qt.GlobalColor.black
+                    
+                    brush = QBrush(QColor(final_color))
+                    self._brush_cache[cached_key] = brush
+                    return brush
+                    
                 elif day_data.get('symbol'):
-                    return QBrush(QColor(Qt.GlobalColor.white if self._is_dark_theme else Qt.GlobalColor.black))
+                    final_color = Qt.GlobalColor.white if self._is_dark_theme else Qt.GlobalColor.black
+                    return self._get_cached_brush(final_color)
 
             if is_employee_column:
                 user_id = str(key[3])
                 if user_id in self._row_colors:
-                    return QBrush(QColor(Qt.GlobalColor.black if not self._is_dark_theme else Qt.GlobalColor.white))
+                    final_color = Qt.GlobalColor.black if not self._is_dark_theme else Qt.GlobalColor.white
+                    return self._get_cached_brush(final_color)
             return None
 
         # --- Pozostałe role ---
@@ -284,20 +324,23 @@ class ScheduleTableModel(QAbstractTableModel):
                     base_hex = self._row_colors[user_id]
                     pal = ROW_COLORS_DARK_THEME if self._is_dark_theme else ROW_COLORS_LIGHT_THEME
                     final = pal.get(base_hex)
-                    if final: return QBrush(QColor(final))
+                    if final: 
+                        return self._get_cached_brush(final)
 
             if not is_employee_column:
                 schedule_col = col - len(self._visible_columns)
 
                 # Kolorowanie dla dni (0..30)
                 if schedule_col < 31:
-                    if day_data.get('is_suggested_off', False): return QBrush(QColor("#006400"))
+                    if day_data.get('is_suggested_off', False): 
+                        return self._get_cached_brush("#006400")
 
                     bg_hex = day_data.get('_bg_color_hex')
                     if bg_hex:
-                        return QBrush(QColor(bg_hex))
+                        return self._get_cached_brush(bg_hex)
                     if day_data.get('symbol'):
-                        return QBrush(QColor(65, 65, 65) if self._is_dark_theme else QColor(225, 225, 225))
+                        color = QColor(65, 65, 65) if self._is_dark_theme else QColor(225, 225, 225)
+                        return self._get_cached_brush(color)
 
                 # --- PRZYWRÓCONE KOLOROWANIE DLA KOLUMN OBLICZENIOWYCH ---
 
