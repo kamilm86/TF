@@ -169,7 +169,7 @@ class OvertimeItemDelegate(QStyledItemDelegate):
         # Obliczamy wymiary "na styk"
         total_width = metrics.horizontalAdvance(text) + (2 * padding_x)
         # Dla wysokości bierzemy max z (wysokość znaku, minimalna estetyczna wysokość)
-        total_height = max(text_bounds.height() + (2 * padding_y), icon_font_size + 2)
+        total_height = max(text_bounds.height() + (1 * padding_y), icon_font_size )-2
 
         bg_rect = QRect(0, 0, total_width, total_height)
 
@@ -1489,6 +1489,12 @@ class WorkScheduleWindow(QMainWindow):
 
         self.table = SplitTableView()
         schedule_layout.addWidget(self.table)
+
+        # --- ZMIANA: Aktywacja delegata do rysowania ikon (skalowanie 65%) ---
+        # Przekazujemy user_app_settings, aby delegat miał dostęp do ustawień
+        self.schedule_delegate = OvertimeItemDelegate(self.user_app_settings, parent=self.table.schedule_view)
+        self.table.schedule_view.setItemDelegate(self.schedule_delegate)
+        # ---------------------------------------------------------------------
 
         # Tworzymy przycisk i kontener na pozostałe przyciski
         self.manage_columns_button = QPushButton("Dostosuj widok")
