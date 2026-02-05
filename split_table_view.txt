@@ -36,7 +36,7 @@ class SplitTableView(QWidget):
         self.employees_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.employees_view.verticalHeader().setDefaultSectionSize(25)
         self.employees_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        self.employees_view.verticalHeader().setMinimumSectionSize(20)
+        self.employees_view.verticalHeader().setMinimumSectionSize(15)
         self.employees_view.horizontalHeader().setFixedHeight(35)
         self.employees_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.employees_view.horizontalHeader().setSectionsClickable(True)
@@ -236,6 +236,26 @@ class SplitTableView(QWidget):
         if self.employees_view.model() and self.schedule_view.model():
             self._sync_row_selection()
         self._force_sync_heights()
+        
+        # --- ZMIANA: Implementacja synchronizacji zmian wysokości wierszy ---
+        # Pozwala na manualną zmianę wysokości wiersza w lewym panelu i aktualizację prawego
+        self.employees_view.verticalHeader().sectionResized.connect(self._on_row_resized)
+
+    def _on_row_resized(self, logical_index, old_size, new_size):
+        """
+        Synchronizuje wysokość wiersza między widokami, gdy użytkownik (lub layout) zmieni rozmiar.
+        """
+        if self._is_updating:
+            return
+
+        self._is_updating = True
+        try:
+            # Ustaw tę samą wysokość w prawym panelu
+            if logical_index < self.schedule_view.model().rowCount():
+                self.schedule_view.setRowHeight(logical_index, new_size)
+                # debug_print(f"[SplitTableView] Zsynchronizowano wiersz {logical_index}: {old_size} -> {new_size}")
+        finally:
+            self._is_updating = False
 
     def _setup_simple_scrollbar_hiding(self):
         self.employees_view.verticalScrollBar().setStyleSheet("QScrollBar:vertical { width: 0px; }")

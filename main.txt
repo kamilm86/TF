@@ -2278,11 +2278,11 @@ class WorkScheduleWindow(QMainWindow):
             header = self.table.schedule_view.horizontalHeader()
             model = self.table.employees_view.model()
 
-            # --- POPRAWKA: Wymuś stałą wysokość wierszy ---
-            # Zapobiega "pływaniu" wysokości wierszy przy zmianie zawartości
-            self.table.schedule_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+            # --- POPRAWKA: Wymuś stałą wysokość wierszy, ALE pozwól na zmianę (Interactive) ---
+            # Dzięki synchronizacji w SplitTableView, zmiana w jednym widoku zaktualizuje drugi.
+            self.table.schedule_view.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
             self.table.schedule_view.verticalHeader().setDefaultSectionSize(row_height)
-            self.table.employees_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+            self.table.employees_view.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
             self.table.employees_view.verticalHeader().setDefaultSectionSize(row_height)
             # -----------------------------------------------
 
