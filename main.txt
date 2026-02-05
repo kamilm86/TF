@@ -67,72 +67,34 @@ class OvertimeItemDelegate(QStyledItemDelegate):
     def __init__(self, settings=None, parent=None):
         super().__init__(parent)
         self.settings = settings or {}
-        # CACHE ZASOBÓW
-        self._color_cache = {}
-        self._font_cache = {}
-        
-        # Pre-cachowanie popularnych kolorów pędzli
-        self._marker_meeting_color = QColor(AppStyles.MARKER_MEETING)
-        self._marker_meeting_color.setAlpha(240)
-        self._marker_meeting_brush = QBrush(self._marker_meeting_color)
-        
-        self._marker_overtime_color = QColor(AppStyles.MARKER_OVERTIME)
-        self._marker_overtime_color.setAlpha(220)
-        self._marker_overtime_brush = QBrush(self._marker_overtime_color)
-        
-        self._marker_suggested_color = QColor(AppStyles.MARKER_SUGGESTED_OFF)
-        self._marker_suggested_color.setAlpha(100)
-        
-        self._nn_brush = QBrush(QColor("#FF0000"))
-        self._white_brush = QBrush(QColor(Qt.white))
-        
-        self._paints_saved_state = False
-
-    def _get_cached_font(self, base_font, size, bold=False):
-        """Pobiera lub tworzy czcionkę z cache."""
-        key = (base_font.family(), size, bold)
-        if key in self._font_cache:
-            return self._font_cache[key]
-        
-        font = QFont(base_font)
-        font.setPointSize(size)
-        if bold:
-            font.setBold(True)
-        self._font_cache[key] = font
-        return font
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex):
         try:
-            # OPTYMALIZACJA: Clip path tylko jeśli potrzebny (np. dla zaokrągleń)
-            # Ale wywołanie save/restore jest drogie. 
-            # Robimy to raz globalnie.
-            
             painter.save()
-            # self._paints_saved_state = True
-            
-            # Clip path - czy na pewno potrzebny dla każdej komórki? 
-            # W oryginalnym kodzie był, więc zostawiamy, ale można by to usunąć dla wydajności.
             clip_path = QPainterPath()
             clip_path.addRoundedRect(option.rect, 4.0, 4.0)
             painter.setClipPath(clip_path)
-            
             super().paint(painter, option, index)
-            # painter.restore() # Nie przywracamy jeszcze, bo rysujemy dalej
-            
+            painter.restore()
+
             special_symbol = index.data(ROLE_SPECIAL_SYMBOL)
             location_symbol = index.data(ROLE_LOCATION_SYMBOL)
             has_meeting = index.data(ROLE_HAS_MEETING)
             has_overtime = index.data(ROLE_HAS_OVERTIME)
             is_suggested_off = index.data(ROLE_IS_SUGGESTED_OFF)
 
+            painter.save()
             painter.setRenderHint(QPainter.Antialiasing)
 
             if has_meeting:
                 marker_size = 7
                 rect = QRect(option.rect.left() + 2, option.rect.bottom() - marker_size - 1, marker_size, marker_size)
                 
-                # Używamy cache pędzla
-                painter.setBrush(self._marker_meeting_brush)
+                # Użycie koloru ze stylów
+                c = QColor(AppStyles.MARKER_MEETING)
+                c.setAlpha(240)
+                painter.setBrush(QBrush(c))
+                
                 painter.setPen(QPen(QColor(0, 0, 0, 220), 1.0))
                 painter.drawEllipse(rect)
 
@@ -140,81 +102,103 @@ class OvertimeItemDelegate(QStyledItemDelegate):
                 marker_size = 7
                 x = option.rect.right() - marker_size - 1
                 y = option.rect.bottom() - marker_size - 1
-                # Polygon tworzymy dynamicznie (zależy od pozycji), ale to tylko 3 punkty
                 triangle = QPolygon(
                     [QPoint(x, y + marker_size), QPoint(x + marker_size, y + marker_size), QPoint(x + marker_size, y)])
                 
-                # Używamy cache pędzla
-                painter.setBrush(self._marker_overtime_brush)
+                # Użycie koloru ze stylów
+                c = QColor(AppStyles.MARKER_OVERTIME)
+                c.setAlpha(220)
+                painter.setBrush(QBrush(c))
+                
                 painter.setPen(QPen(Qt.black, 1.0))
                 painter.drawPolygon(triangle)
 
             if is_suggested_off:
-                # Używamy cache koloru dla fillRect
-                painter.fillRect(option.rect, self._marker_suggested_color)
+                # Nakładamy półprzezroczysty zielony kolor na tło
+                user_name = index.model().data(index.siblingAtColumn(2), Qt.DisplayRole)
+                # debug_print(f"Delegate: Rysuję zielone tło dla {user_name} w kolumnie {index.column()}")
+                
+                # Użycie koloru ze stylów
+                c = QColor(AppStyles.MARKER_SUGGESTED_OFF)
+                c.setAlpha(100)
+                painter.fillRect(option.rect, c)
 
             show_special = self.settings.get('show_special_symbol', True)
             show_location = self.settings.get('show_location_symbol', True)
-            
-            # Check if we need to draw anything else
-            if (special_symbol and show_special) or (location_symbol and show_location):
-                special_pos = self.settings.get('special_symbol_position', 'top_left')
-                location_pos = self.settings.get('location_symbol_position', 'top_right')
+            special_pos = self.settings.get('special_symbol_position', 'top_left')
+            location_pos = self.settings.get('location_symbol_position', 'top_right')
 
-                if special_symbol and show_special:
-                    self._draw_text_with_background(painter, option, special_symbol, special_pos)
-                if location_symbol and show_location:
-                    self._draw_text_with_background(painter, option, location_symbol, location_pos)
+            if special_symbol and show_special:
+                self._draw_text_with_background(painter, option, special_symbol, special_pos)
+            if location_symbol and show_location:
+                self._draw_text_with_background(painter, option, location_symbol, location_pos)
 
             painter.restore()
         except Exception as e:
             log_error(f"Błąd podczas rysowania delegata: {e}")
 
     def _draw_text_with_background(self, painter: QPainter, option: QStyleOptionViewItem, text: str, position: str):
-        # OPTYMALIZACJA: Lepsze skalowanie i cache czcionek
+        icon_font = QFont(option.font)
+
+        # --- ZMIANA 1: Lepsze skalowanie proporcji ---
         main_size = option.font.pointSize()
+
+        # Zamiast odejmować stałą wartość, używamy mnożnika.
+        # Ikona będzie miała ok. 65% wielkości głównego tekstu.
+        # Np. Główny 10 -> Ikona 6
+        #     Główny 13 -> Ikona 8 (a nie 11 jak wcześniej)
+        #     Główny 16 -> Ikona 10
         icon_font_size = max(7, int(main_size * 0.65))
 
-        # Pobieramy czcionkę z cache
-        cached_font = self._get_cached_font(option.font, icon_font_size)
-        painter.setFont(cached_font)
+        icon_font.setPointSize(icon_font_size)
+        # Ustawiamy pogrubienie dla małych ikon, żeby były czytelne
+        # if icon_font_size < 8:
+        #     icon_font.setBold(True)
+
+        painter.setFont(icon_font)
 
         metrics = painter.fontMetrics()
-        
-        # boundingRect jest dość drogie - dla krótkich tekstów (2-3 litery) można by to cache'ować,
-        # ale na razie zostawmy, bo wymiary zależą od fontu
+
+        # --- ZMIANA 2: Ciaśniejszy padding ---
         text_bounds = metrics.boundingRect(text)
 
-        padding_x = 1
-        padding_y = 0
+        # Zmniejszamy padding, aby ramka nie była "napompowana"
+        padding_x = 1  # Minimalny odstęp po bokach
+        padding_y = 0  # Brak dodatkowego odstępu w pionie
 
+        # Obliczamy wymiary "na styk"
         total_width = metrics.horizontalAdvance(text) + (2 * padding_x)
+        # Dla wysokości bierzemy max z (wysokość znaku, minimalna estetyczna wysokość)
         total_height = max(text_bounds.height() + (2 * padding_y), icon_font_size + 2)
 
-        # Obliczamy pozycję
-        # Rect dla tła
         bg_rect = QRect(0, 0, total_width, total_height)
-        
+
+        # 3. Pozycjonowanie (zerowy margines od krawędzi komórki)
         margin_x = 0
         margin_y = 0
 
         if position == 'top_left':
             bg_rect.moveTo(option.rect.topLeft() + QPoint(margin_x, margin_y))
+
         elif position == 'top_right':
             bg_rect.moveTo(option.rect.topRight() + QPoint(-bg_rect.width() - margin_x, margin_y))
 
-        # Rysowanie tła - używamy cache pędzli
+        # 4. Rysowanie - specjalne kolory dla wybranych symboli
         if text.upper() == 'NN':
-            painter.setBrush(self._nn_brush)
-            text_color = Qt.white
+            # NN (Nieobecność Nieusprawiedliwiona) - czerwone tło
+            painter.setBrush(QColor("#FF0000"))  # Czerwony (Bardziej widoczny)
+            text_color = QColor(Qt.white)
         else:
-            painter.setBrush(self._white_brush)
-            text_color = Qt.black
+            # Domyślnie białe tło
+            painter.setBrush(QColor(Qt.white))
+            text_color = QColor(Qt.black)
         
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(bg_rect, 3, 3)
 
         painter.setPen(text_color)
+
+        # Precyzyjne centrowanie w małej ramce
         painter.drawText(bg_rect, Qt.AlignCenter, text)
 
 
