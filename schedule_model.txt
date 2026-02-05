@@ -101,7 +101,8 @@ class ScheduleTableModel(QAbstractTableModel):
 
     def set_row_colors(self, colors: dict) -> None:
         self._row_colors = colors if colors is not None else {}
-        self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
+        if self.rowCount() > 0:
+            self.dataChanged.emit(self.index(0, 0), self.index(self.rowCount() - 1, self.columnCount() - 1))
 
     def set_custom_columns(self, custom_columns: dict):
         self._custom_columns = custom_columns if custom_columns is not None else {}
@@ -809,7 +810,8 @@ class ScheduleTableModel(QAbstractTableModel):
             self.endResetModel()
         else:
             self._processed_data = filtered_data
-            self.dataChanged.emit(self.index(0, 0), self.index(self._row_count - 1, self._column_count - 1))
+            if self._row_count > 0:
+                self.dataChanged.emit(self.index(0, 0), self.index(self._row_count - 1, self._column_count - 1))
 
     def get_processed_data(self):
         return self._processed_data

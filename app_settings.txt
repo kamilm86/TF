@@ -8,6 +8,7 @@ class AppSettings:
     """Globalny kontener na ustawienia i logikę biznesową ładowaną z bazy danych."""
     def __init__(self):
         self.REQUIRED_VERSION = APP_VERSION
+        self.ALLOWED_TEST_VERSION = None # Opcjonalna wersja testowa
         self.FORCE_UPDATE = False
         self.PERMISSIONS = defaultdict(set)
         self.SYMBOL_CATEGORIES = {}
@@ -41,6 +42,8 @@ class AppSettings:
         try:
             if key == 'current_version':
                 self.REQUIRED_VERSION = value
+            elif key == 'test_version':
+                self.ALLOWED_TEST_VERSION = value
             elif key == 'force_update':
                 self.FORCE_UPDATE = value.lower() == 'true'
             elif key == 'AppPermissions':

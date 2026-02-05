@@ -343,7 +343,7 @@ class DataProvider(QObject):
             
             # Budowanie cache i przetwarzanie (operacje CPU)
             events_cache = self._build_events_cache(events_data)
-            processed_data_base = self._build_processed_data_without_icons(schedule_data)
+            processed_data_base = self._build_processed_data_without_icons(schedule_data, year, month)
 
             container = MonthlyDataContainer(
                 schedule_data=schedule_data,
@@ -352,6 +352,9 @@ class DataProvider(QObject):
                 events_cache=events_cache,
                 last_updated=time.time()
             )
+            
+            # Zobaczmy ile kluczy powstało
+            debug_print(f"[assemble_and_cache_data] Utworzono kontener. processed_data_base keys: {len(container.processed_data_base)}")
 
             # Zapis do cache (operacja atomowa w Pythonie dla słownika)
             self.monthly_cache[cache_key] = container
@@ -446,8 +449,8 @@ class DataProvider(QObject):
                         norm_nr = _normalize_nr_kadrowy(nr_kadrowy)
                         user_key = nr_kadrowy_to_key_map.get(norm_nr)
                         if not user_key:
-                            debug_print(
-                                f"Sugestia wolnego: brak dopasowania dla nr_kadrowy={nr_kadrowy!r} (norm={norm_nr!r} data={date_str}")
+                            # debug_print(
+                            #     f"Sugestia wolnego: brak dopasowania dla nr_kadrowy={nr_kadrowy!r} (norm={norm_nr!r} data={date_str}")
                             continue
 
                         try:
@@ -653,12 +656,12 @@ class DataProvider(QObject):
 
         debug_print(f"DataProvider (ZMODYFIKOWANA WERSJA): Zakończono _update_dynamic_icons.")
 
-    def _build_processed_data_without_icons(self, schedule_data: List[Dict]) -> Dict:
+    def _build_processed_data_without_icons(self, schedule_data: List[Dict], year: int, month: int) -> Dict:
         """
         Przetwarza dane z już spivotowanego zapytania SQL.
         WERSJA FINALNA UI: Wyświetla TYLKO GODZINY (Start;Czas).
         """
-        if not self._current_year or not self._current_month or not schedule_data:
+        if not year or not month or not schedule_data:
             return {}
 
         from app_settings import app_settings

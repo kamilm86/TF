@@ -675,6 +675,8 @@ class BackgroundCheckerThread(QThread):
             cursor = conn.cursor()
             cursor.execute(f"SELECT SettingValue FROM {SQL_OBJECTS['appsettings']} WHERE SettingKey = 'current_version'")
             version_row = cursor.fetchone()
+            cursor.execute(f"SELECT SettingValue FROM {SQL_OBJECTS['appsettings']} WHERE SettingKey = 'test_version'")
+            test_version_row = cursor.fetchone()
             cursor.execute(f"SELECT SettingValue FROM {SQL_OBJECTS['appsettings']} WHERE SettingKey = 'force_update'")
             force_update_row = cursor.fetchone()
 
@@ -682,7 +684,16 @@ class BackgroundCheckerThread(QThread):
             from packaging.version import parse as parse_version
             is_update_forced = force_update_row[0].lower() == 'true' if force_update_row else False
             required_version = version_row[0] if version_row else APP_VERSION
-            is_version_obsolete = parse_version(APP_VERSION) != parse_version(required_version)
+            
+            # Spradzamy czy wersja jest zgodna z Wymaganą LUB Testową
+            current_v = parse_version(APP_VERSION)
+            is_valid_stable = current_v == parse_version(required_version)
+            is_valid_test = False
+            
+            if test_version_row and test_version_row[0]:
+                 is_valid_test = current_v == parse_version(test_version_row[0])
+
+            is_version_obsolete = not (is_valid_stable or is_valid_test)
 
             if is_update_forced or is_version_obsolete:
                 self.update_required.emit(is_update_forced, is_version_obsolete)

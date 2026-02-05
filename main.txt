@@ -6002,6 +6002,7 @@ class WorkScheduleWindow(QMainWindow):
             self.raw_data = schedule_data
             self.all_events_data = events_data
             self.processed_data = processed_data
+            debug_print(f"[_apply_loaded_data] Assigned self.processed_data. Keys count: {len(self.processed_data) if self.processed_data else 0}")
 
             is_initial_load = self.schedule_model.rowCount() == 0
 
@@ -6026,15 +6027,19 @@ class WorkScheduleWindow(QMainWindow):
                 all_statuses = sorted(list(set(e.get('status', '') for e in self.all_events_data if e.get('status'))))
                 self.status_filter_combo.add_items(all_statuses)
                 self.status_filter_combo.select_items(all_statuses)
-
+            
+            debug_print(f"[_apply_loaded_data] filters_to_restore: {filters_to_restore}")
             if filters_to_restore:
                 self.restore_filters_state(filters_to_restore)
             else:
                 last_filters = self.user_app_settings.get('last_filters')
+                debug_print(f"[_apply_loaded_data] filters_to_restore=None. last_filters: {last_filters}")
                 if last_filters:
                     self.restore_filters_state(last_filters)
                 else:
+                    debug_print("[_apply_loaded_data] No filters. Calling update_filters & filter_data.")
                     self.update_filters()
+                    # ZMIANA: Wymuś filtrowanie, aby pokazać dane domyślne (np. wszystkich)
                     self.filter_data()
 
             if is_initial_load:
@@ -6205,6 +6210,14 @@ class WorkScheduleWindow(QMainWindow):
             selected_przelozeni = self.get_list_selected_items(self.przelozony_list)
             # Ta metoda (get_list_selected_data) poprawnie zwraca ID (z Qt.UserRole)
             selected_uzytkownik_ids = self.get_list_selected_data(self.uzytkownik_list)
+
+            debug_print(f"[filter_processed_data] START. processed_data len: {len(self.processed_data)}")
+            debug_print(f"[filter_processed_data] selected_wydzialy: {selected_wydzialy}")
+            debug_print(f"[filter_processed_data] selected_przelozeni: {selected_przelozeni}")
+
+            # Optymalizacja: jeśli wybrano wszystkich, ustaw None dla szybszego sprawdzania
+            if not selected_wydzialy: selected_wydzialy = None
+            if not selected_przelozeni: selected_przelozeni = None
 
             # Pobranie tekstu z pól wyszukiwania
             przelozony_search_text = self.przelozony_filter.text().lower().strip()
@@ -6392,14 +6405,15 @@ class WorkScheduleWindow(QMainWindow):
         return state
 
     def restore_filters_state(self, state):
-        """
-        Przywraca zapisany stan filtrów po załadowaniu nowych danych.
-        """
-        debug_print("Rozpoczynam przywracanie stanu filtrów...")
+        """Przywraca stan filtrów z zapisanego słownika."""
+        if not state:
+            return
 
-        self._cross_filtering_enabled = False
-
+        debug_print(f"[restore_filters_state] Restoring state: {state}")
+        self._cross_filtering_enabled = False  # Blokujemy cross-filtering na czas przywracania
         try:
+            # Przywróć datę obecności/nieobecności
+            absence_date_str = state.get('absence_date') # This line was problematic in the instruction, corrected to be syntactically valid.
             # Wypełnij wszystkie ComboBoxy i listy nowymi danymi
             # (Ta metoda musi być wywołana jako pierwsza)
             self.update_filters()
@@ -9213,7 +9227,17 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Krok 2: Sprawdź wersję aplikacji PRZED utworzeniem głównego okna
-    if parse_version(APP_VERSION) != parse_version(app_settings.REQUIRED_VERSION):
+    # Krok 2: Sprawdź wersję aplikacji PRZED utworzeniem głównego okna
+    is_version_ok = parse_version(APP_VERSION) == parse_version(app_settings.REQUIRED_VERSION)
+    
+    # Obsługa wersji testowej
+    if not is_version_ok and app_settings.ALLOWED_TEST_VERSION:
+         is_version_ok = parse_version(APP_VERSION) == parse_version(app_settings.ALLOWED_TEST_VERSION)
+         if is_version_ok:
+             from debug_utils import debug_print
+             debug_print(f"Uruchomiono w trybie WERSJI TESTOWEJ: {APP_VERSION}")
+
+    if not is_version_ok:
         dialog = UpdateRequiredDialog()
         dialog.exec()
         sys.exit(0)
