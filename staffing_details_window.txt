@@ -1428,6 +1428,10 @@ class StaffingDetailsWindow(QDialog):
                 # --- POPRAWKA LOGIKI ---
                 spec = parsed.get('special_symbol')
                 if spec and spec.strip():
+                    # FIX: Wymuszone wykluczenie symbolu PR z obsady
+                    if spec.upper() == 'PR':
+                        continue
+                        
                     if spec.upper() not in app_settings.WORK_LIKE_SYMBOLS:
                         continue
                 # -----------------------
@@ -1734,6 +1738,10 @@ class StaffingDetailsWindow(QDialog):
                 # Pomijamy dzień TYLKO wtedy, gdy jest symbol specjalny I NIE JEST on symbolem pracującym.
                 # Jeśli to np. HO, DYS, T - kod pójdzie dalej i policzy godziny.
                 if special_symbol and special_symbol.strip():
+                    # FIX: Wymuszone wykluczenie symbolu PR z obsady
+                    if special_symbol.upper() == 'PR':
+                        continue
+
                     if special_symbol.upper() not in app_settings.WORK_LIKE_SYMBOLS:
                         continue
                         # -----------------------
