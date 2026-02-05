@@ -2278,6 +2278,14 @@ class WorkScheduleWindow(QMainWindow):
             header = self.table.schedule_view.horizontalHeader()
             model = self.table.employees_view.model()
 
+            # --- POPRAWKA: Wymuś stałą wysokość wierszy ---
+            # Zapobiega "pływaniu" wysokości wierszy przy zmianie zawartości
+            self.table.schedule_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+            self.table.schedule_view.verticalHeader().setDefaultSectionSize(row_height)
+            self.table.employees_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+            self.table.employees_view.verticalHeader().setDefaultSectionSize(row_height)
+            # -----------------------------------------------
+
             # scale_factor = day_column_width / 45.0
             scale_factor = 1.0
             special_widths = {
@@ -2289,10 +2297,25 @@ class WorkScheduleWindow(QMainWindow):
             }
 
             for logical_index in range(model.columnCount()):
+                # Domyślna szerokość z profilu
+                width_to_set = day_column_width
+                
                 header_text = model.headerData(logical_index, Qt.Horizontal, Qt.DisplayRole)
                 if header_text:
-                    header_text = str(header_text).replace("<br>", "\n")
-                width_to_set = special_widths.get(header_text, day_column_width)
+                    header_text_str = str(header_text).replace("<br>", "\n")
+                    # Nadpisz jeśli to kolumna specjalna
+                    if header_text_str in special_widths:
+                        width_to_set = special_widths[header_text_str]
+                    
+                    # --- POPRAWKA: Sprawdź czy mamy zapisaną szerokość dla tej kolumny ---
+                    # Klucz zgodny z _save_column_widths_state: "sched_col_NAGŁÓWEK"
+                    key = f"sched_col_{header_text}"
+                    if key in saved_widths:
+                         saved_w = saved_widths[key]
+                         if saved_w > 0:
+                             width_to_set = saved_w
+                    # -------------------------------------------------------------------
+
                 header.resizeSection(logical_index, width_to_set)
 
             # 5. Ukrywanie dni (spoza miesiąca ORAZ ukrytych ręcznie)
@@ -4067,6 +4090,12 @@ class WorkScheduleWindow(QMainWindow):
             return
         self._updating_filters = True
         try:
+
+            # Krok 0: Zapisz aktualne szerokości kolumn!
+            # Filtracja powoduje reset modelu (beginResetModel), co niszczy ustawienia widoku.
+            # Musimy je zapisać i odtworzyć.
+            column_widths = self._save_column_widths_state()
+
             # Krok 1: Aktualizacja i zastosowanie filtrów
             self.update_cross_filters()
             filtered_data = self.filter_processed_data()
@@ -4074,6 +4103,9 @@ class WorkScheduleWindow(QMainWindow):
 
             # Krok 2: Zawsze po filtrowaniu, zastosuj zapisane sortowanie
             self.apply_custom_sort()
+
+            # Krok 3: Przywróć szerokości kolumn
+            self._restore_column_widths_state(column_widths)
             
             # --- Integracja z oknem szkoleń ---
             self._sync_filters_to_training_window(filtered_data)
@@ -4309,6 +4341,96 @@ class WorkScheduleWindow(QMainWindow):
             log_error(f"Błąd przy pobieraniu danych z modelu dla {user_id}/{date_str}: {e}")
 
         return None
+
+    def _save_column_widths_state(self):
+        """
+        Zapisuje szerokości kolumn przed operacją, która może zresetować model.
+        Zwraca słownik {id_kolumny: szerokość} dla obu widoków (pracownicy i grafik).
+        """
+        widths = {}
+        if not hasattr(self, 'table'):
+            return widths
+
+        model = self.schedule_model
+
+        # 1. Lewy panel (Pracownicy)
+        if hasattr(self.table, 'employees_view'):
+            header = self.table.employees_view.horizontalHeader()
+            visible_cols = model.get_visible_columns()
+            for i in range(header.count()):
+                col_id = "unknown_emp"
+                # Próbujemy dopasować ID z visible_columns
+                if i < len(visible_cols):
+                    col_id = visible_cols[i]
+                else:
+                     col_id = f"emp_col_{i}"
+                
+                widths[col_id] = header.sectionSize(i)
+
+        # 2. Prawy panel (Grafik - Dni)
+        if hasattr(self.table, 'schedule_view'):
+            header_sched = self.table.schedule_view.horizontalHeader()
+            # W prawym panelu kolumny to dni miesiąca + kolumny specjalne (Suma RBH itp.)
+            # Kluczujemy po nagłówku (tekście), bo to jest unikalne w tym widoku
+            count = header_sched.count()
+            # Musimy przesunąć indeks logiczny, bo model jest wspólny - ale schedule_view pokazuje tylko dalsze kolumny?
+            # NIE, ScheduleView i EmployeesView dzielą model, ale używają columnHidden.
+            # EmployeesView pokazuje 0..N, ScheduleView pokazuje N+1..M.
+            # Ale horizontalHeader().sectionSize(logicalIndex) działa na indeksach logicznych modelu.
+            
+            # Pobieramy szerokości dla WSZYSTKICH kolumn modelu, żeby być bezpiecznym.
+            # create a safely reversible ID for schedule columns
+            start_sched_col = len(model.get_visible_columns())
+            for i in range(start_sched_col, model.columnCount()):
+                 header_text = model.headerData(i, Qt.Horizontal, Qt.DisplayRole)
+                 if header_text:
+                     # Użyj prefiksu, żeby nie nadpisać kolumn pracownika
+                     key = f"sched_col_{header_text}"
+                     widths[key] = header_sched.sectionSize(i)
+
+        return widths
+
+    def _restore_column_widths_state(self, widths):
+        """Przywraca szerokości kolumn po resecie modelu."""
+        if not widths or not hasattr(self, 'table'):
+            return
+
+        model = self.schedule_model
+
+        # 1. Lewy panel
+        if hasattr(self.table, 'employees_view'):
+            header = self.table.employees_view.horizontalHeader()
+            header.blockSignals(True)
+            try:
+                visible_cols = model.get_visible_columns()
+                for i in range(header.count()):
+                    col_id = ""
+                    if i < len(visible_cols):
+                        col_id = visible_cols[i]
+                    else:
+                        col_id = f"emp_col_{i}"
+                    
+                    width = widths.get(col_id)
+                    if width is not None and width > 0:
+                        header.resizeSection(i, width)
+            finally:
+                header.blockSignals(False)
+
+        # 2. Prawy panel
+        if hasattr(self.table, 'schedule_view'):
+            header_sched = self.table.schedule_view.horizontalHeader()
+            header_sched.blockSignals(True)
+            try:
+                start_sched_col = len(model.get_visible_columns())
+                for i in range(start_sched_col, model.columnCount()):
+                    header_text = model.headerData(i, Qt.Horizontal, Qt.DisplayRole)
+                    if header_text:
+                        key = f"sched_col_{header_text}"
+                        width = widths.get(key)
+                        if width is not None and width > 0:
+                            header_sched.resizeSection(i, width)
+            finally:
+                header_sched.blockSignals(False)
 
     def _save_view_state(self):
         """Zapisuje stabilne identyfikatory zaznaczenia, sortowanie i pozycję przewijania."""
@@ -6593,9 +6715,13 @@ class WorkScheduleWindow(QMainWindow):
                 self.saved_filters_combo.setCurrentIndex(0)
                 self.saved_filters_combo.blockSignals(False)
 
+            # Reset dat do domyślnych dla miesiąca
+            self.update_filter_dates()
+
         finally:
             self._cross_filtering_enabled = True
             debug_print("[Filtracja] Wywołuję filter_data() po wyczyszczeniu filtrów.")
+            # filter_data() wywoła teraz nasze _restore_column_widths_state, co jest OK
             self.filter_data()
             self._update_delete_button_state()
 

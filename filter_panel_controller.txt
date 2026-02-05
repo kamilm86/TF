@@ -559,33 +559,9 @@ class FilterPanelController:
 
     def _clear_all_filters(self):
         """Resetuje wszystkie filtry do stanu początkowego."""
-        # 1. Resetuj Combo Boxy
-        # Iterujemy po znanych nazwach atrybutów combo boxów w main_window
-        filter_definitions = [
-            "grupa_main_filter_combo", "wydzial_combo", "default_location_combo",
-            "system_czasu_pracy_combo", "rola_combo", "podrola_combo",
-            "jezyk_combo", "etat_combo", "dtn_combo", "rka_combo",
-            "grafik_za_punkty_combo", "brak_nocki_combo"
-        ]
-        
-        for combo_name in filter_definitions:
-            if hasattr(self.main_window, combo_name):
-                combo = getattr(self.main_window, combo_name)
-                if isinstance(combo, CustomMultiComboBox):
-                    combo.clear_selection()
-
-        # 2. Resetuj pola tekstowe i listy
-        if hasattr(self.main_window, 'przelozony_filter'):
-            self.main_window.przelozony_filter.clear()
-        if hasattr(self.main_window, 'uzytkownik_filter'):
-            self.main_window.uzytkownik_filter.clear()
-            
-        # 3. Resetuj checkboxy obecności/nieobecności
-        if hasattr(self.main_window, 'filter_by_presence_check'):
-             self.main_window.filter_by_presence_check.setChecked(False)
-        if hasattr(self.main_window, 'filter_by_absence_check'):
-             self.main_window.filter_by_absence_check.setChecked(False)
-
-        # Odśwież dane
-        if hasattr(self.main_window, 'filter_data'):
-            self.main_window.filter_data()
+        # Deleguj do metody w main.py, która obsługuje pełne czyszczenie (w tym odświeżanie dat i modelu)
+        if hasattr(self.main_window, 'clear_filters'):
+            self.main_window.clear_filters()
+        else:
+            # Fallback (gdyby metoda nie istniała, choć powinna)
+            log_error("Brak metody main_window.clear_filters()!")
