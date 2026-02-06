@@ -169,7 +169,7 @@ class OvertimeItemDelegate(QStyledItemDelegate):
         # Obliczamy wymiary "na styk"
         total_width = metrics.horizontalAdvance(text) + (2 * padding_x)
         # Dla wysokości bierzemy max z (wysokość znaku, minimalna estetyczna wysokość)
-        total_height = max(text_bounds.height() + (1 * padding_y), icon_font_size )-2
+        total_height = max(text_bounds.height() + (1 * padding_y), icon_font_size)-2
 
         bg_rect = QRect(0, 0, total_width, total_height)
 
@@ -1306,25 +1306,65 @@ class WorkScheduleWindow(QMainWindow):
             contains_vacation_symbol=contains_vacation_symbol
         )
         # --- KONIEC ZMIANY ---
+        
+        # Sprawdź czy któraś komórka zawiera symbol S (szkolenie)
+        cells_with_s_symbol = [
+            cell for cell in schedule_cells 
+            if (parse_symbol(cell.get('symbol', '')).get('special_symbol') or '').upper() == 'S'
+        ]
+        
         if events_to_cancel:
             grouped_events = self._group_events_by_user_date(events_to_cancel)
             delegations_info = self._prepare_delegations_description(grouped_events)
             confirmation_message += f"<br><br>{delegations_info}"
 
-        reply = show_confirmation_dialog(self, "Potwierdzenie usunięcia", confirmation_message)
+        # --- POPRAWKA: Użyj ScrollableDecisionDialog zamiast show_confirmation_dialog ---
+        intro_text = "Czy na pewno chcesz usunąć symbole dla następujących pozycji?"
+        question_text = ""
+        if contains_vacation_symbol:
+            question_text = "⚠️ Ta operacja spowoduje również usunięcie urlopu z planów urlopowych."
+        if cells_with_s_symbol:
+            if question_text:
+                question_text += "\n"
+            question_text += "⚠️ Komórki z symbolem S zostaną najpierw zaktualizowane (usunięcie symbolu szkolenia)."
+        
+        # Przekształć HTML message na format dla ScrollableDecisionDialog
+        details_html = confirmation_message.replace("Czy na pewno chcesz usunąć symbole dla następujących pozycji?<br><br>", "")
+        
+        dialog = ScrollableDecisionDialog(
+            self, 
+            "Potwierdzenie usunięcia",
+            intro_text,
+            details_html,
+            question_text,
+            yes_text="Tak, usuń", 
+            no_text="Anuluj"
+        )
+        
+        if dialog.exec() != QDialog.Accepted:
+            return
+        # --- KONIEC POPRAWKI ---
 
-        if reply == QMessageBox.Yes:
-            if events_to_cancel: self.delegation_canceler.start_cancellation(events_to_cancel)
-            self._clear_cells_symbols(schedule_cells)
+        # --- POPRAWKA: Logika dla symbolu S - najpierw UPDATE, potem odwołanie zdarzeń ---
+        # Krok 1: Usuń symbol S z grafiku (UPDATE przed odwołaniem zdarzeń)
+        if cells_with_s_symbol:
+            self._remove_s_symbol_directly(cells_with_s_symbol)
+        
+        # Krok 2: Odwołaj zdarzenia
+        if events_to_cancel:
+            self.delegation_canceler.start_cancellation(events_to_cancel)
+        
+        # Krok 3: Wyczyść symbole procedurą
+        self._clear_cells_symbols(schedule_cells)
 
-            # --- NOWA ZMIANA: Wymuś odświeżenie ikon po operacji ---
-            # Po usunięciu symbolu i odwołaniu zdarzeń, musimy jawnie
-            # poinformować DataProvider, że dane dla tych komórek są nieaktualne,
-            # co spowoduje ponowne przeliczenie i usunięcie ikon.
-            current_data = self.date_combo.currentData()
-            if current_data:
-                year, month = current_data
-                self.data_provider.invalidate_complete_cache_for_pairs(list(user_date_pairs))
+        # --- NOWA ZMIANA: Wymuś odświeżenie ikon po operacji ---
+        # Po usunięciu symbolu i odwołaniu zdarzeń, musimy jawnie
+        # poinformować DataProvider, że dane dla tych komórek są nieaktualne,
+        # co spowoduje ponowne przeliczenie i usunięcie ikon.
+        current_data = self.date_combo.currentData()
+        if current_data:
+            year, month = current_data
+            self.data_provider.invalidate_complete_cache_for_pairs(list(user_date_pairs))
 
     def _clear_cells_symbols(self, schedule_cells: list):
         """Przygotowuje żądania usunięcia symboli i przekazuje je do ScheduleChangeProcessor."""
@@ -8449,11 +8489,20 @@ class WorkScheduleWindow(QMainWindow):
 
                     # 2. Pobierz aktualne dane i zaktualizuj symbol
                     current_data = self.schedule_model.data(index, ROLE_DATA)
-                    if isinstance(current_data, dict):
-                        current_data['symbol'] = new_symbol
-                        # Wymuś odświeżenie w modelu (emit dataChanged)
-                        self.schedule_model.setData(index, current_data, ROLE_DATA)
-                        debug_print(f"Zaktualizowano symbol w modelu dla ({user_id}, {date_str}) -> {new_symbol}")
+                    
+                    # POPRAWKA: Utwórz strukturę danych jeśli nie istnieje (pusta komórka)
+                    if not isinstance(current_data, dict):
+                        current_data = {
+                            'symbol': '',
+                            'uzytkownik_id': user_id,
+                            'date_str': date_str
+                        }
+                        debug_print(f"Utworzono nową strukturę danych w modelu dla ({user_id}, {date_str})")
+                    
+                    current_data['symbol'] = new_symbol
+                    # Wymuś odświeżenie w modelu (emit dataChanged)
+                    self.schedule_model.setData(index, current_data, ROLE_DATA)
+                    debug_print(f"Zaktualizowano symbol w modelu dla ({user_id}, {date_str}) -> {new_symbol}")
 
                 # 3. Zaktualizuj cache DataProvider (jeśli istnieje)
                 # To ważne, aby po przewinięciu/odświeżeniu dane nie wróciły do starego stanu
@@ -8473,65 +8522,80 @@ class WorkScheduleWindow(QMainWindow):
                             for key, user_data in container.processed_data_base.items():
                                 if str(key[3]) == str(user_id):
                                     day_int = int(d_parts[2])
-                                    if 'days' in user_data and day_int in user_data['days']:
-                                        day_data = user_data['days'][day_int]
+                                    
+                                    # POPRAWKA: Jeśli dzień nie istnieje w cache, utwórz go
+                                    if 'days' not in user_data:
+                                        user_data['days'] = {}
+                                    
+                                    if day_int not in user_data['days']:
+                                        # Tworzymy nową strukturę dla pustego dnia
+                                        user_data['days'][day_int] = {
+                                            'symbol': '',
+                                            'hours': 0,
+                                            'start_hour': None,
+                                            '_display_value': '',
+                                            '_bg_color_hex': None
+                                        }
+                                        debug_print(f"Utworzono nową strukturę dnia w CACHE dla ({user_id}, {date_str})")
+                                    
+                                    day_data = user_data['days'][day_int]
+                                    
+                                    # 1. Zapisz stary symbol
+                                    old_symbol = day_data.get('symbol', '')
                                         
-                                        # 1. Zapisz stary symbol
-                                        old_symbol = day_data.get('symbol', '')
-                                        
-                                        # 2. Ustaw nowy symbol
-                                        day_data['symbol'] = new_symbol
-                                        
-                                        # 3. Przelicz godziny
-                                        parsed = parse_symbol(str(new_symbol))
-                                        old_hours = parse_symbol(old_symbol).get('work_hours', 0) or 0
-                                        new_hours = parsed.get('work_hours', 0) or 0
-                                        
-                                        day_data['hours'] = new_hours
-                                        day_data['start_hour'] = parsed.get('start_hour')
+                                    # 2. Ustaw nowy symbol
+                                    day_data['symbol'] = new_symbol
+                                    
+                                    # 3. Przelicz godziny
+                                    parsed = parse_symbol(str(new_symbol))
+                                    old_hours = parse_symbol(old_symbol).get('work_hours', 0) or 0
+                                    new_hours = parsed.get('work_hours', 0) or 0
+                                    
+                                    day_data['hours'] = new_hours
+                                    day_data['start_hour'] = parsed.get('start_hour')
 
-                                        # 4. Aktualizacja sumy godzin w wierszu
-                                        user_data['total_hours'] = (user_data.get('total_hours', 0) or 0) - old_hours + new_hours
-                                        
-                                        # 5. Aktualizacja Cache UI (Wyświetlanie i Kolory)
-                                        start_h = parsed.get('start_hour')
-                                        work_h = parsed.get('work_hours')
-                                        spec = parsed.get('special_symbol')
-                                        spec_upper = spec.upper() if spec else ""
-                                        
-                                        # A. Aktualizacja _display_value (TYLKO GODZINY)
-                                        day_data['_display_value'] = ""
-                                        if start_h is not None:
-                                            if work_h is not None:
-                                                val_float = float(work_h)
-                                                val_str = str(int(val_float)) if val_float.is_integer() else str(val_float)
-                                                day_data['_display_value'] = f"{start_h};{val_str}"
-                                            else:
-                                                day_data['_display_value'] = str(start_h)
-                                        
-                                        # B. Aktualizacja _bg_color_hex (Priorytet Absencji)
-                                        bg_color = None
-                                        absence_set = app_settings.get_absence_symbols()
-                                        is_absence = spec_upper in absence_set or spec_upper in ["OS", "U", "UZ"]
+                                    # 4. Aktualizacja sumy godzin w wierszu
+                                    user_data['total_hours'] = (user_data.get('total_hours', 0) or 0) - old_hours + new_hours
+                                    
+                                    # 5. Aktualizacja Cache UI (Wyświetlanie i Kolory)
+                                    start_h = parsed.get('start_hour')
+                                    work_h = parsed.get('work_hours')
+                                    spec = parsed.get('special_symbol')
+                                    spec_upper = spec.upper() if spec else ""
+                                    
+                                    # A. Aktualizacja _display_value (TYLKO GODZINY)
+                                    day_data['_display_value'] = ""
+                                    if start_h is not None:
+                                        if work_h is not None:
+                                            val_float = float(work_h)
+                                            val_str = str(int(val_float)) if val_float.is_integer() else str(val_float)
+                                            day_data['_display_value'] = f"{start_h};{val_str}"
+                                        else:
+                                            day_data['_display_value'] = str(start_h)
+                                    
+                                    # B. Aktualizacja _bg_color_hex (Priorytet Absencji)
+                                    bg_color = None
+                                    absence_set = app_settings.get_absence_symbols()
+                                    is_absence = spec_upper in absence_set or spec_upper in ["OS", "U", "UZ"]
 
-                                        if is_absence:
-                                            if spec_upper in ["OS", "U", "UZ"]:
-                                                bg_color = "#FFFF00"
-                                            else:
-                                                bg_color = "#9370DB"
-                                        elif start_h is not None:
-                                            try:
-                                                bg_color = app_settings.SHIFT_COLOR_MAP.get(int(start_h), "#FFFFFF")
-                                            except (ValueError, TypeError):
-                                                bg_color = "#FFFFFF"
+                                    if is_absence:
+                                        if spec_upper in ["OS", "U", "UZ"]:
+                                            bg_color = "#FFFF00"
+                                        else:
+                                            bg_color = "#9370DB"
+                                    elif start_h is not None:
+                                        try:
+                                            bg_color = app_settings.SHIFT_COLOR_MAP.get(int(start_h), "#FFFFFF")
+                                        except (ValueError, TypeError):
+                                            bg_color = "#FFFFFF"
 
-                                        day_data['_bg_color_hex'] = bg_color
-                                        
-                                        # 6. Wymuszenie przeliczenia statystyk wiersza (ważne dla Liderów)
-                                        if hasattr(self, 'schedule_model'):
-                                            self.schedule_model.recalculate_row_stats(user_data)
+                                    day_data['_bg_color_hex'] = bg_color
+                                    
+                                    # 6. Wymuszenie przeliczenia statystyk wiersza (ważne dla Liderów)
+                                    if hasattr(self, 'schedule_model'):
+                                        self.schedule_model.recalculate_row_stats(user_data)
 
-                                        debug_print(f"Zaktualizowano symbol w CACHE dla ({user_id}, {date_str}) -> {new_symbol}")
+                                    debug_print(f"Zaktualizowano symbol w CACHE dla ({user_id}, {date_str}) -> {new_symbol}")
                                     break
             
             except Exception as e:
@@ -8593,10 +8657,10 @@ class WorkScheduleWindow(QMainWindow):
                 skipped_day_off.append(cell_data.get('uzytkownik_dane', 'Nieznany'))
                 continue
                 
-            # 2. Blokada U/OS dla Lidera (jeśli target też Lider -> OK, ale jeśli target Lider a my Lider...)
-            # Oryginalna logika: special_symbol in ['U', 'OS'] and target_role == 'Lider' -> Skip
+            # 2. Blokada U/OS dla Lidera - może wstawić TYLKO innemu Liderowi
+            # Skipujemy gdy target NIE jest Liderem (bo Lider nie może dawać U/OS Pracownikom)
             if user_role != 'Lider OUT':
-                if special_symbol_upper in ['U', 'OS'] and target_role == 'Lider':
+                if special_symbol_upper in ['U', 'OS'] and target_role != 'Lider':
                     skipped_restricted.append(cell_data.get('uzytkownik_dane', 'Nieznany'))
                     continue
 
