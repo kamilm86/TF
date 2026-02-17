@@ -1630,13 +1630,11 @@ class WorkScheduleWindow(QMainWindow):
         self.status_filter_combo = CustomMultiComboBox()
         self.status_filter_combo.setMinimumWidth(130)
 
-        # Checkboxy
-        self.meetings_checkbox = QCheckBox("Spotkania")
-        self.trainings_checkbox = QCheckBox("Szkolenia")
-        self.overtime_checkbox = QCheckBox("Nadgodziny")
-        self.meetings_checkbox.setChecked(True)
-        self.trainings_checkbox.setChecked(True)
-        self.overtime_checkbox.setChecked(True)
+        # Lista rozwijana wielokrotnego wyboru dla typów zdarzeń
+        self.event_type_combo = CustomMultiComboBox()
+        self.event_type_combo.add_items(["Spotkanie", "Szkolenie", "Nadgodziny"])
+        self.event_type_combo.select_items(["Spotkanie", "Szkolenie", "Nadgodziny"])
+        self.event_type_combo.setMinimumWidth(130)
 
         # Dodanie wszystkich kontrolek do layoutu w poprawnej kolejności
         events_filter_layout.addWidget(QLabel("Data od:"))
@@ -1650,20 +1648,17 @@ class WorkScheduleWindow(QMainWindow):
         events_filter_layout.addWidget(QLabel("Status:"))
         events_filter_layout.addWidget(self.status_filter_combo)
 
-        events_filter_layout.addStretch()  # Wypełniacz, aby odsunąć checkboxy na prawo
+        # events_filter_layout.addStretch()
 
-        events_filter_layout.addWidget(self.meetings_checkbox)
-        events_filter_layout.addWidget(self.trainings_checkbox)
-        events_filter_layout.addWidget(self.overtime_checkbox)
+        events_filter_layout.addWidget(QLabel("Typ:"))
+        events_filter_layout.addWidget(self.event_type_combo)
 
-        # Połączenie sygnałów (bez zmian)
+        # Połączenie sygnałów
         self.date_from.dateChanged.connect(self.filter_events_table)
         self.date_to.dateChanged.connect(self.filter_events_table)
         self.topic_filter.textChanged.connect(self.filter_events_table)
         self.name_filter.textChanged.connect(self.filter_events_table)
-        self.meetings_checkbox.stateChanged.connect(self.filter_events_table)
-        self.trainings_checkbox.stateChanged.connect(self.filter_events_table)
-        self.overtime_checkbox.stateChanged.connect(self.filter_events_table)
+        self.event_type_combo.selection_changed.connect(self.filter_events_table)
         self.status_filter_combo.selection_changed.connect(self.filter_events_table)
 
         return events_filter_frame
@@ -2068,7 +2063,8 @@ class WorkScheduleWindow(QMainWindow):
                 is_comment_column_checked=self.show_comment_column,
                 is_percent_morning_checked=self.show_percent_morning_column,
                 is_percent_ho_checked=self.show_percent_ho_column,
-                sort_preferences=self.user_sort_preferences
+                sort_preferences=self.user_sort_preferences,
+                existing_custom_columns=self.custom_columns
             )
             if dialog.exec() == QDialog.Accepted:
                 # 1. Najpierw zapisz stan BIEŻĄCY (zanim cokolwiek zmienimy)
@@ -4180,27 +4176,24 @@ class WorkScheduleWindow(QMainWindow):
 
             filtered_data = source_data.copy()
 
-            # Filtr typów
-            allowed_types = []
-            if self.meetings_checkbox.isChecked(): allowed_types.append('Spotkanie')
-            if self.trainings_checkbox.isChecked(): allowed_types.append('Szkolenie')
-            if self.overtime_checkbox.isChecked(): allowed_types.append('Nadgodziny')
+            # Filtr typów (lista rozwijana wielokrotnego wyboru)
+            allowed_types = self.event_type_combo.get_selected_items()
             if allowed_types:
-                filtered_data = [e for e in filtered_data if e.get('type') in allowed_types]
+                filtered_data = [e for e in filtered_data if e.get('evt_type') in allowed_types]
 
             # Filtr statusu
             selected_statuses = self.status_filter_combo.get_selected_items()
             if selected_statuses:
-                filtered_data = [e for e in filtered_data if e.get('status') in selected_statuses]
+                filtered_data = [e for e in filtered_data if e.get('evt_status') in selected_statuses]
 
             # Filtry tekstowe i dat
             topic_filter = self.topic_filter.text().lower()
             if topic_filter:
-                filtered_data = [e for e in filtered_data if topic_filter in str(e.get('topic', '')).lower()]
+                filtered_data = [e for e in filtered_data if topic_filter in str(e.get('evt_topic', '')).lower()]
 
             name_filter = self.name_filter.text().lower()
             if name_filter:
-                filtered_data = [e for e in filtered_data if name_filter in str(e.get('name', '')).lower()]
+                filtered_data = [e for e in filtered_data if name_filter in str(e.get('evt_name', '')).lower()]
 
             date_from_str = self.date_from.date().toString('yyyy-MM-dd')
             date_to_str = self.date_to.date().toString('yyyy-MM-dd')
@@ -6054,6 +6047,21 @@ class WorkScheduleWindow(QMainWindow):
         """Asynchroniczne ładowanie danych z progress dialogiem."""
         from functools import partial
 
+        # POPRAWKA: Zachowaj referencję do starego wątku aby GC go nie usunął
+        # w trakcie działania (co powodowało crash QThread::Destroyed).
+        if hasattr(self, 'loading_thread') and self.loading_thread is not None:
+            old_thread = self.loading_thread
+            # Odłącz wszystkie sygnały starego wątku, żeby nie wywoływał callbacków
+            try:
+                old_thread.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            # Przechowaj referencję do starego wątku - usuń gdy się zakończy
+            if not hasattr(self, '_finishing_threads'):
+                self._finishing_threads = []
+            self._finishing_threads.append(old_thread)
+            old_thread.finished.connect(lambda t=old_thread: self._remove_old_thread(t))
+
         debug_print(f"Uruchamiam async ładowanie dla {year}-{month}")
 
         # --- NOWA LOGIKA: Użycie nowoczesnego wskaźnika ładowania ---
@@ -6070,9 +6078,18 @@ class WorkScheduleWindow(QMainWindow):
 
         self.loading_thread.start()
 
+    def _remove_old_thread(self, thread):
+        """Usuwa stary wątek z listy po zakończeniu (zapobiega memory leak)."""
+        if hasattr(self, '_finishing_threads') and thread in self._finishing_threads:
+            self._finishing_threads.remove(thread)
+            debug_print("[GUARD] Usunięto stary wątek z _finishing_threads.")
+
     def _clear_loading_thread_reference(self):
-        """Czyści referencję do loading_thread po zakończeniu wątku."""
-        self.loading_thread = None
+        """Czyści referencję do loading_thread po zakończeniu wątku.
+        Sprawdza tożsamość - czyści tylko jeśli sender to aktualny wątek."""
+        sender_thread = self.sender()
+        if sender_thread is self.loading_thread:
+            self.loading_thread = None
 
 
     def _on_async_data_loaded(self, data, filters_to_restore=None):
@@ -6510,6 +6527,8 @@ class WorkScheduleWindow(QMainWindow):
                     # Przywróć zaznaczenie
                     if item.text() in selected_items:
                         item.setSelected(True)
+                    else:
+                        item.setSelected(False)
                     # Przywróć ukrycie na podstawie filtra wyszukiwania
                     if search_text and search_text not in item.text().lower():
                         item.setHidden(True)
@@ -6605,12 +6624,16 @@ class WorkScheduleWindow(QMainWindow):
             self.brak_nocki_combo.select_items(state.get('brak_nocki', []))
 
             # --- NOWOŚĆ: Przywracanie filtra nieobecności ---
-            if state.get('absence_checked', False):
-                self.filter_by_absence_check.setChecked(True)
+            self.filter_by_absence_check.setChecked(state.get('absence_checked', False))
 
             self.absence_symbol_combo.select_items(state.get('absence_symbols', []))
             self.absence_hour_combo.select_items(state.get('absence_hours', []))
             self.presence_date_edit.setDate(QDate.currentDate())
+
+            # POPRAWKA: Wyczyść zaznaczenia PRZED przywracaniem,
+            # aby filtry się zastępowały zamiast nakładać.
+            self.przelozony_list.clearSelection()
+            self.uzytkownik_list.clearSelection()
 
             # Przywróć przełożonego (używa tekstu)
             przelozeni_items_text = state.get('przelozony', [])
@@ -6769,7 +6792,8 @@ class WorkScheduleWindow(QMainWindow):
             debug_print("[Filtracja] Wywołuję filter_data() po wyczyszczeniu filtrów.")
             # filter_data() wywoła teraz nasze _restore_column_widths_state, co jest OK
             self.filter_data()
-            self._update_delete_button_state()
+            if hasattr(self, 'filter_controller'):
+                self.filter_controller._update_delete_button_state()
 
     def filter_przelozony_list(self, text):
         """
@@ -8838,7 +8862,8 @@ class WorkScheduleWindow(QMainWindow):
                 'rka_combo', 'podrola_combo', 'presence_location_combo',
                 'presence_hour_combo', 'absence_symbol_combo', 'absence_hour_combo',
                 'status_filter_combo', 'saved_filters_combo',
-                'grafik_za_punkty_combo', 'brak_nocki_combo'  # <-- Nowe filtry
+                'grafik_za_punkty_combo', 'brak_nocki_combo',
+                'event_type_combo'  # Lista rozwijana typów zdarzeń
             ]
         ]
         for combo in combos_to_style:
@@ -8860,7 +8885,6 @@ class WorkScheduleWindow(QMainWindow):
 
         checkboxes_to_style = [
             getattr(self, name, None) for name in [
-                'meetings_checkbox', 'trainings_checkbox', 'overtime_checkbox',
                 'filter_by_presence_check', 'filter_by_absence_check'
             ]
         ]

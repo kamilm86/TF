@@ -607,7 +607,7 @@ class StaffingDetailsWindow(QDialog):
         self._tabs_dirty_state = {i: True for i in range(7)}
         # ----------------------------------------
 
-        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint | Qt.WindowCloseButtonHint)
         self.setWindowTitle(f"Szczegóły obsady i analizy dla {month:02}/{year}")
         self.setMinimumSize(800, 500)
 
@@ -1416,10 +1416,10 @@ class StaffingDetailsWindow(QDialog):
 
         # 1. Obliczanie godzin z grafiku
         for user_key, user_schedule in schedule_data.items():
-            if user_schedule.get('dtn') == 1:
+            if user_schedule.get('sched_dtn') == 1:
                 continue
 
-            korekta = float(user_schedule.get('korekta', 0.0) or 0.0)
+            korekta = float(user_schedule.get('sched_korekta', 0.0) or 0.0)
 
             for day, day_info in user_schedule.get('days', {}).items():
                 day_idx = day - 1
@@ -1468,7 +1468,7 @@ class StaffingDetailsWindow(QDialog):
 
                     # Sprawdzenie DTN dla osoby z nadgodzinami
                     user_data = next((data for key, data in schedule_data.items() if key[3] == user_id), None)
-                    if user_data and user_data.get('dtn') == 1:
+                    if user_data and user_data.get('sched_dtn') == 1:
                         continue
 
                     # Pobierz czasy jako stringi
@@ -1714,19 +1714,19 @@ class StaffingDetailsWindow(QDialog):
         granular_staffing = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 
         for user_key, user_data in schedule_data.items():
-            if user_data.get('dtn') == 1:
+            if user_data.get('sched_dtn') == 1:
                 continue
 
             user_id = user_key[3]
             user_info = {
                 'WydzialGrafik': user_key[0],
-                'RolaNazwa': user_data.get('rola_nazwa', ''),
-                'JęzykNazwa': user_data.get('jezyk', ''),
-                'SystemCzasuPracyNazwa': user_data.get('system_czasu_pracy', '')
+                'RolaNazwa': user_data.get('sched_rola', ''),
+                'JęzykNazwa': user_data.get('sched_jezyk', ''),
+                'SystemCzasuPracyNazwa': user_data.get('sched_system_pracy', '')
             }
 
             try:
-                korekta = float(user_data.get('korekta', 0.0) or 0.0)
+                korekta = float(user_data.get('sched_korekta', 0.0) or 0.0)
             except (ValueError, TypeError):
                 korekta = 0.0
 
@@ -1769,7 +1769,7 @@ class StaffingDetailsWindow(QDialog):
                         user_info['RolaNazwa'],
                         user_info['JęzykNazwa'],
                         user_info['SystemCzasuPracyNazwa'],
-                        parsed_symbol.get('location') or user_data.get('lokalizacja_domyslna', 'h')
+                        parsed_symbol.get('location') or user_data.get('sched_lokalizacja', 'h')
                     )
                     granular_staffing[day][current_hour][grouping_key] += 1
 
@@ -2012,7 +2012,7 @@ class StaffingDetailsWindow(QDialog):
         summary = defaultdict(float)
         location_map = {'h': 'Home Office', 's': 'Stacjonarnie', 'p': 'Przystanek'}
         for user_schedule in schedule_data.values():
-            default_loc = user_schedule.get('lokalizacja_domyslna', 'h')
+            default_loc = user_schedule.get('sched_lokalizacja', 'h')
             for day_info in user_schedule.get('days', {}).values():
                 parsed = parse_symbol(day_info.get('symbol', ''))
                 hours = parsed.get('work_hours')
@@ -2038,11 +2038,11 @@ class StaffingDetailsWindow(QDialog):
 
         # 1. Oblicz sumy dzienne dla grafiku
         for user_key, user_schedule in schedule_data.items():
-            if user_schedule.get('dtn') == 1:
+            if user_schedule.get('sched_dtn') == 1:
                 continue
 
             user_id, wydzial = user_key[3], user_key[0] or "Brak"
-            korekta = float(user_schedule.get('korekta', 0.0) or 0.0)
+            korekta = float(user_schedule.get('sched_korekta', 0.0) or 0.0)
 
             for day, day_info in user_schedule.get('days', {}).items():
                 parsed = parse_symbol(day_info.get('symbol', ''))
@@ -2143,7 +2143,7 @@ class StaffingDetailsWindow(QDialog):
         # 1. Oblicz sumy dzienne dla grafiku i zdarzeń
         for user_key, user_schedule in schedule_data.items():
             user_id, wydzial = user_key[3], user_key[0] or "Brak"
-            korekta = float(user_schedule.get('korekta', 0.0) or 0.0)
+            korekta = float(user_schedule.get('sched_korekta', 0.0) or 0.0)
 
             for day, day_info in user_schedule.get('days', {}).items():
                 parsed = parse_symbol(day_info.get('symbol', ''))
@@ -2216,7 +2216,7 @@ class StaffingDetailsWindow(QDialog):
         location_map = {}
         for user_key, user_schedule in schedule_data.items():
             user_id = user_key[3]
-            default_location = user_schedule.get('lokalizacja_domyslna', 'h')
+            default_location = user_schedule.get('sched_lokalizacja', 'h')
             for day, day_info in user_schedule.get('days', {}).items():
                 symbol = day_info.get('symbol', '')
                 if symbol:
@@ -2304,24 +2304,6 @@ class StaffingDetailsWindow(QDialog):
 
         return matrix
 
-    # --- NOWA METODA: Zapisywanie rozmiaru przy zamknięciu ---
-    def closeEvent(self, event):
-        """Zapisuje aktualne wymiary okna do ustawień i wymusza zapis do bazy."""
-        if self.parent_widget and hasattr(self.parent_widget, 'user_app_settings'):
-            # 1. Zapisz wymiary do słownika ustawień w pamięci głównego okna
-            current_size = (self.width(), self.height())
-            self.parent_widget.user_app_settings['staffing_window_size'] = current_size
-
-            # 2. Wymuś natychmiastowy zapis do bazy danych SQL
-            # Dzięki temu rozmiar zostanie zapamiętany nawet przy awarii aplikacji
-            if hasattr(self.parent_widget, 'settings_db'):
-                self.parent_widget.settings_db.save_settings(
-                    self.parent_widget.user_app_settings
-                )
-                # from debug_utils import debug_print
-                # debug_print(f"Zapisano wymiary okna obsady do bazy: {current_size}")
-
-        event.accept()
 
     def _on_tab_changed(self, index):
         """Slot wywoływany po zmianie zakładki."""

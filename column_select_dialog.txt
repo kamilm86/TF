@@ -20,7 +20,7 @@ class ColumnSelectDialog(QDialog):
     def __init__(self, parent=None, available_columns=None, visible_columns=None,
                  default_columns=None, user_role=None, is_comment_column_checked=False,
                  is_percent_morning_checked=False,  is_percent_ho_checked=False,
-                 sort_preferences=None):
+                 sort_preferences=None, existing_custom_columns=None):
         super().__init__(parent)
         self.parent_widget = parent
         self.is_dark_theme = True
@@ -35,8 +35,17 @@ class ColumnSelectDialog(QDialog):
         self.visible_columns = visible_columns or []
         self.default_columns = default_columns or []
         self.column_map = {col_id: name for col_id, name, width in self.available_columns}
-        self.custom_columns = {col_id: {'name': name, 'values': {}} for col_id, name, _ in self.available_columns if
-                               col_id.startswith("custom_")}
+
+        # POPRAWKA: Zachowaj istniejące wartości z custom_columns
+        existing = existing_custom_columns or {}
+        self.custom_columns = {}
+        for col_id, name, _ in self.available_columns:
+            if col_id.startswith("custom_"):
+                if col_id in existing:
+                    # Zachowaj istniejące wartości użytkownika
+                    self.custom_columns[col_id] = existing[col_id]
+                else:
+                    self.custom_columns[col_id] = {'name': name, 'values': {}}
         self.user_role = user_role
         self.sort_preferences = sort_preferences if sort_preferences is not None else []
 

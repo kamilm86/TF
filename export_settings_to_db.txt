@@ -137,7 +137,8 @@ def export_settings():
         # Urlopy
         "U": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UZ": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
         "UB": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UM": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
-        "UO": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UOD": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "UO": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UD": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
+        "UOD": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
         "US": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UT": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
         "UW": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"], "UOP": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],
         "USW": ["Pracownik WPR", "Lider OUT", "Lider", "Administrator"],  # Przeniesiono z "Inne" dla spójności

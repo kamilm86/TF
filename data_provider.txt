@@ -888,6 +888,9 @@ class DataProvider(QObject):
                 event['date_key'] = self._standardize_date(event['evt_date'])
                 event['id'] = event['evt_id']
                 event['type'] = event['evt_type']
+                event['status'] = event['evt_status']
+                event['topic'] = event['evt_topic']
+                event['name'] = event['evt_name']
 
                 # Formatowanie dat/godzin
                 for key in ['evt_time_from', 'evt_time_to', 'evt_modified_date']:
