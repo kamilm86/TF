@@ -44,6 +44,7 @@ class FilterPanelController:
         self.main_window.saved_filters_combo.addItem("") # Pusta opcja
         self._update_saved_filters_combo()
         self.main_window.saved_filters_combo.currentIndexChanged.connect(self._load_selected_filter_set_from_combo)
+        self.main_window.saved_filters_combo.currentIndexChanged.connect(self._update_delete_button_state)
         header_layout.addWidget(self.main_window.saved_filters_combo, 1)
 
         # Przyciski (Stretch=0)
@@ -469,6 +470,7 @@ class FilterPanelController:
             debug_print(f"Automatyczne wczytywanie zestawu filtrów: '{filter_name}'")
             if hasattr(self.main_window, 'restore_filters_state'):
                 self.main_window.restore_filters_state(filter_state)
+            self._update_delete_button_state()
         else:
             log_error(f"Nie znaleziono zapisanego stanu dla filtra '{filter_name}'.")
             self.main_window.saved_filters_combo.setCurrentIndex(0)
