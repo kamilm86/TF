@@ -305,6 +305,7 @@ class FilterPanelController:
             ("Etat:", "etat_combo", "etat"),
             ("DTN:", "dtn_combo", "dtn"),
             ("Rka:", "rka_combo", "rka"),
+            ("Korekta:", "sched_korekta_combo", "sched_korekta"),
             ("Grafik za pkt:", "grafik_za_punkty_combo", "sched_grafik_za_punkty"),
             ("Brak nocki:", "brak_nocki_combo", "sched_brak_nocki")
         ]

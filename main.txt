@@ -666,6 +666,7 @@ class WorkScheduleWindow(QMainWindow):
             ('etat', "Etat:", False),
             ('dtn', "DTN:", False),
             ('rka', "Rka:", False),
+            ('sched_korekta', "Korekta:", False),
             ('sched_grafik_za_punkty', "Grafik za pkt:", False),
             ('sched_brak_nocki', "Brak nocki:", False)
         ]
@@ -5516,6 +5517,7 @@ class WorkScheduleWindow(QMainWindow):
         selected_rka = self.rka_combo.get_selected_items()
         selected_grafik_pkt = self.grafik_za_punkty_combo.get_selected_items()
         selected_brak_nocki = self.brak_nocki_combo.get_selected_items()
+        selected_korekta = self.sched_korekta_combo.get_selected_items() if hasattr(self, 'sched_korekta_combo') else []
         selected_jezyki = self.jezyk_combo.get_selected_items()
         selected_etaty = self.etat_combo.get_selected_items()
         selected_scp = self.system_czasu_pracy_combo.get_selected_items()
@@ -5599,6 +5601,21 @@ class WorkScheduleWindow(QMainWindow):
                 continue
             if selected_rka and data.get('sched_rka', '') not in selected_rka:
                 continue
+            
+            if selected_korekta:
+                 val = data.get('sched_korekta')
+                 if val is not None:
+                     try:
+                         val_float = float(val)
+                         val_str = str(int(val_float))
+                     except (ValueError, TypeError):
+                         val_str = str(val)
+                     
+                     if val_str not in selected_korekta:
+                         continue
+                 else:
+                     continue # Jeśli wartość jest None, a filtr jest aktywny, to pomijamy (chyba że dodamy opcję pustą)
+
             if selected_podrola and data.get('sched_podrola', '') not in selected_podrola:
                 continue
 
@@ -6933,6 +6950,10 @@ class WorkScheduleWindow(QMainWindow):
             selected_abs_symbols = self.absence_symbol_combo.get_selected_items()
             # --------------------------------------------------------------
 
+            # --- NOWY FILTR KOREKTA ---
+            selected_korekta = self.sched_korekta_combo.get_selected_items() if hasattr(self, 'sched_korekta_combo') else []
+            # --------------------------
+
             selected_przelozeni_text = self.get_list_selected_items(self.przelozony_list)
             selected_uzytkownik_ids = self.get_list_selected_data(self.uzytkownik_list)
 
@@ -6953,7 +6974,9 @@ class WorkScheduleWindow(QMainWindow):
             dtn_values = set()
             rka_values = set()
             grafik_pkt_values = set()
+            grafik_pkt_values = set()
             brak_nocki_values = set()
+            korekta_values = set()
 
             # Dane do list
             przelozeni_set = set()
@@ -6985,6 +7008,19 @@ class WorkScheduleWindow(QMainWindow):
 
                 val_nocki = data.get('sched_brak_nocki')
                 brak_nocki_values.add(str(val_nocki) if val_nocki and str(val_nocki).strip() else 'NIE')
+
+                if (val := data.get('sched_korekta')) is not None:
+                     # Formatuj tak jak w modelu (ScheduleModel) - inty bez .0
+                     try:
+                         val_float = float(val)
+                         korekta_values.add(str(int(val_float)))
+                     except (ValueError, TypeError):
+                         korekta_values.add(str(val))
+            
+            # Wymuś styl combo (fix dla niespójności graficznej np. strzałki)
+            if hasattr(self, 'sched_korekta_combo'):
+                theme = "dark" if self.is_dark_theme else "light"
+                self.sched_korekta_combo.setStyleSheet(AppStyles.get_combobox_style(theme))
 
             # Aplikowanie wartości do ComboBoxów
             self.wydzial_combo.add_items(sorted(list(wydzialy)))
@@ -7020,6 +7056,16 @@ class WorkScheduleWindow(QMainWindow):
 
             self.brak_nocki_combo.add_items(sorted(list(brak_nocki_values)))
             self.brak_nocki_combo.select_items(selected_brak_nocki)
+
+            if hasattr(self, 'sched_korekta_combo'):
+                # Sortuj numerycznie
+                def try_parse(x):
+                    try: return float(x)
+                    except: return 0.0
+                
+                sorted_korekta = sorted(list(korekta_values), key=try_parse)
+                self.sched_korekta_combo.add_items(sorted_korekta)
+                self.sched_korekta_combo.select_items(selected_korekta)
 
             # --- Wypełnianie combo symboli nieobecności ---
             absence_def_set = app_settings.get_absence_symbols()
