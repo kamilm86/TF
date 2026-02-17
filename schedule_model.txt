@@ -511,12 +511,8 @@ class ScheduleTableModel(QAbstractTableModel):
 
         return str(value)
 
-    def sort(self, column, order):
-        if column >= len(self._visible_columns): return
-        col_id = self._visible_columns[column]
-        self.layoutAboutToBeChanged.emit()
-        self._keys.sort(key=lambda k: self._get_sort_key(k, col_id), reverse=(order == Qt.DescendingOrder))
-        self.layoutChanged.emit()
+
+
 
     def sort_by_column_id(self, col_id: str, order: Qt.SortOrder):
         if not self._keys: return
