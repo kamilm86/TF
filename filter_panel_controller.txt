@@ -8,6 +8,7 @@ from ui_components import CustomMultiComboBox
 from filter_select_dialog import FilterSelectDialog
 from ui_utils import show_warning_dialog, show_info_dialog, create_clear_icon, create_settings_icon
 from debug_utils import debug_print, log_error
+from config import resource_path
 
 class FilterPanelController:
     """
@@ -50,14 +51,14 @@ class FilterPanelController:
         # Przyciski (Stretch=0)
 
         self.main_window.save_filter_button = QPushButton()
-        self.main_window.save_filter_button.setIcon(QIcon("icons/save.png"))
+        self.main_window.save_filter_button.setIcon(QIcon(resource_path("icons/save.png")))
         self.main_window.save_filter_button.setFixedSize(28, 28)
         self.main_window.save_filter_button.setToolTip("Zapisz bieżący układ filtrów (Ctrl+S)")
         self.main_window.save_filter_button.clicked.connect(self._handle_save_button_clicked)
         header_layout.addWidget(self.main_window.save_filter_button, 0)
 
         self.main_window.edit_filter_button = QPushButton()
-        self.main_window.edit_filter_button.setIcon(QIcon("icons/edit.png"))
+        self.main_window.edit_filter_button.setIcon(QIcon(resource_path("icons/edit.png")))
         self.main_window.edit_filter_button.setToolTip("Zmień nazwę wybranego filtra")
         self.main_window.edit_filter_button.setFixedSize(28, 28) # Changed height to match others (was 24)
         self.main_window.edit_filter_button.clicked.connect(self._rename_selected_filter_set)
@@ -65,7 +66,7 @@ class FilterPanelController:
         header_layout.addWidget(self.main_window.edit_filter_button, 0)
 
         self.main_window.delete_filter_button = QPushButton()
-        self.main_window.delete_filter_button.setIcon(QIcon("icons/delete.png"))
+        self.main_window.delete_filter_button.setIcon(QIcon(resource_path("icons/delete.png")))
         self.main_window.delete_filter_button.setFixedSize(28, 28)
         self.main_window.delete_filter_button.setToolTip("Usuń wybrany filtr")
         self.main_window.delete_filter_button.clicked.connect(self._delete_selected_filter_set)
@@ -106,7 +107,7 @@ class FilterPanelController:
         # 4b. Przycisk "Dodaj/Usuń Filtr"
         self.main_window.filter_select_button = QPushButton()
         # Używamy settings.png dla konfiguracji widoczności filtrów
-        self.main_window.filter_select_button.setIcon(QIcon("icons/settings.png"))
+        self.main_window.filter_select_button.setIcon(QIcon(resource_path("icons/settings.png")))
         self.main_window.filter_select_button.setFixedSize(28, 28)
         self.main_window.filter_select_button.setToolTip("Zarządzaj widocznością filtrów")
         self.main_window.filter_select_button.clicked.connect(self.show_filter_select_dialog)

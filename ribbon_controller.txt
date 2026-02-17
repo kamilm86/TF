@@ -1,12 +1,12 @@
 # ribbon_controller.py
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QComboBox, 
                                QFrame, QSizePolicy, QStyle)
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QImageReader
 from PySide6.QtCore import Qt, QSize
 from datetime import datetime
 from config import resource_path
 from app_settings import app_settings
-from debug_utils import log_error
+from debug_utils import log_error, debug_print
 
 class RibbonController:
     """
@@ -15,6 +15,16 @@ class RibbonController:
     """
     def __init__(self, main_window):
         self.main_window = main_window
+
+        
+        # DEBUG: Sprawdź obsługiwane formaty
+        formats = [fmt.data().decode() for fmt in QImageReader.supportedImageFormats()]
+        debug_print(f"Supported Image Formats: {formats}")
+
+        # The setup_top_bar method will be called externally by main_window,
+        # so we don't call it here directly.
+        # self._init_ribbon() # This line was in the instruction but seems to imply a refactor not explicitly requested.
+                              # Keeping setup_top_bar as the public interface for now.
 
     def setup_top_bar(self, main_layout):
         """Tworzy i zwraca ramkę górnego paska narzędzi."""
@@ -137,9 +147,29 @@ class RibbonController:
         return top_bar_frame
 
     def _load_icon(self, path):
+        import os
+        from debug_utils import debug_print, log_error
         try:
-            return QIcon(resource_path(path))
-        except Exception:
+            full_path = resource_path(path)
+            debug_print(f"Loading icon: {path} -> {full_path}")
+            if not os.path.exists(full_path):
+                log_error(f"ICON NOT FOUND: {full_path}")
+                return QIcon()
+            
+            icon = QIcon(full_path)
+            if icon.isNull():
+                 log_error(f"FAILED TO LOAD ICON: {full_path} (Obiekt QIcon jest null)")
+            else:
+                 # Sprawdźmy czy ikona ma faktycznie jakieś rozmiary na starcie
+                 available_sizes = icon.availableSizes()
+                 if not available_sizes:
+                     debug_print(f"ICON LOADED but has NO available sizes: {full_path}")
+                 else:
+                     debug_print(f"ICON LOAED SUCCESS: {full_path}, Sizes: {available_sizes}")
+
+            return icon
+        except Exception as e:
+            log_error(f"EXCEPTION loading icon {path}: {e}")
             return QIcon()
 
     def toggle_notifications(self):
