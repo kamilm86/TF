@@ -2096,7 +2096,7 @@ class WorkScheduleWindow(QMainWindow):
                 
                 self.settings_db.save_settings(self.user_app_settings)
 
-                self._synchronize_custom_filter_widgets()
+                self.filter_controller.synchronize_custom_filter_widgets()
                 self.update_filters()
 
                 # Oblicz deltę szerokości dla okna (logika bez zmian)
@@ -7017,10 +7017,7 @@ class WorkScheduleWindow(QMainWindow):
                      except (ValueError, TypeError):
                          korekta_values.add(str(val))
             
-            # Wymuś styl combo (fix dla niespójności graficznej np. strzałki)
-            if hasattr(self, 'sched_korekta_combo'):
-                theme = "dark" if self.is_dark_theme else "light"
-                self.sched_korekta_combo.setStyleSheet(AppStyles.get_combobox_style(theme))
+            
 
             # Aplikowanie wartości do ComboBoxów
             self.wydzial_combo.add_items(sorted(list(wydzialy)))
@@ -8909,9 +8906,18 @@ class WorkScheduleWindow(QMainWindow):
                 'presence_hour_combo', 'absence_symbol_combo', 'absence_hour_combo',
                 'status_filter_combo', 'saved_filters_combo',
                 'grafik_za_punkty_combo', 'brak_nocki_combo',
-                'event_type_combo'  # Lista rozwijana typów zdarzeń
+                'event_type_combo', 'sched_korekta_combo'  # Lista rozwijana typów zdarzeń
             ]
         ]
+        
+        # --- NOWOŚĆ: Dodaj dynamicznie filtry dla kolumn niestandardowych ---
+        if hasattr(self, 'custom_columns'):
+            for col_id in self.custom_columns.keys():
+                combo_name = f"filter_combo_{col_id}"
+                combo_widget = getattr(self, combo_name, None)
+                if combo_widget:
+                    combos_to_style.append(combo_widget)
+        # -------------------------------------------------------------------
         for combo in combos_to_style:
             if combo:
                 combo.setStyleSheet(combo_style)
@@ -9302,69 +9308,8 @@ class WorkScheduleWindow(QMainWindow):
         QApplication.clipboard().setText(clipboard_string)
         self.statusBar().showMessage(f"Skopiowano dane z {len(selected_indexes)} komórek.", 3000)
 
-    def _synchronize_custom_filter_widgets(self):
-        """
-        Tworzy widgety filtrów dla nowych kolumn niestandardowych i usuwa widgety
-        dla kolumn, które zostały usunięte.
-        """
-        debug_print("[Filtracja] Rozpoczęto synchronizację widgetów filtrów niestandardowych...")
 
-        current_col_ids = set(self.custom_columns.keys())
-        current_map_ids = set(k for k in self.filter_widget_map.keys() if k.startswith("custom_"))
 
-        # 1. Usuń widgety dla kolumn, które już nie istnieją
-        cols_to_remove = current_map_ids - current_col_ids
-        for col_id in cols_to_remove:
-            debug_print(f"[Filtracja] Usuwanie widgetu filtra dla: {col_id}")
-            widget = self.filter_widget_map.pop(col_id, None)
-            if widget:
-                widget.setParent(None)
-                widget.deleteLater()
-            # Usuń też z listy widocznych, jeśli tam jest
-            if col_id in self.visible_filters_list:
-                self.visible_filters_list.remove(col_id)
-
-        # 2. Dodaj widgety dla nowych kolumn
-        cols_to_add = current_col_ids - current_map_ids
-        for col_id in cols_to_add:
-            col_name = self.custom_columns[col_id].get('name', col_id)
-            debug_print(f"[Filtracja] Tworzenie widgetu filtra dla: {col_id} (Nazwa: {col_name})")
-
-            # Pobierz nadrzędny widget (filter_container) z self.filters_layout
-            parent_widget = self.filters_layout.parentWidget()
-            if not parent_widget:
-                log_error("[Filtracja] Nie można znaleźć rodzica dla nowych widgetów filtra!")
-                parent_widget = self._left_panel  # Fallback
-
-            # Użyjemy add_horizontal_filter do stworzenia kontrolek
-            # Ważne: ta metoda używa self.add_horizontal_filter, która zwraca (layout, combo, btn)
-            # Potrzebujemy kontenera dla tego layoutu
-
-            # Tworzymy layout i jego kontrolki
-            # Używamy unikalnej nazwy obiektu dla comboboxa
-            layout, combo, btn = self.filter_controller.add_horizontal_filter(f"{col_name}:", f"filter_combo_{col_id}")
-
-            # Tworzymy widget-kontener z właściwym rodzicem
-            container_widget = QWidget(parent=parent_widget)
-
-            # Ustawiamy rodziców dla elementów layoutu
-            combo.setParent(container_widget)
-            btn.setParent(container_widget)
-            for i in range(layout.count()):
-                item = layout.itemAt(i)
-                if item and item.widget():
-                    item.widget().setParent(container_widget)
-
-            container_widget.setLayout(layout)
-            container_widget.setVisible(False)  # Domyślnie ukryty, aż _apply_filter_visibility_and_order go pokaże
-
-            # Zapisujemy kontener w mapie
-            self.filter_widget_map[col_id] = container_widget
-
-            # Zastosuj styl
-            theme = "dark" if self.is_dark_theme else "light"
-            combo.setStyleSheet(AppStyles.get_combobox_style(theme))
-            btn.setIcon(self.clear_icon_dark if self.is_dark_theme else self.clear_icon_light)
 
     def _on_heartbeat_tick(self):
         """
