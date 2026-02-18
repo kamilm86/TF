@@ -118,6 +118,9 @@ class FilterPanelController:
 
         # 4. Tworzenie widgetów filtrów (ale jeszcze nie dodawanie ich do layoutu)
         self._create_all_filter_widgets(parent_widget=left_panel)
+        
+        # 4b. Synchronizacja custom filtrów (Tworzenie widgetów dla kolumn własnych)
+        self.synchronize_custom_filter_widgets()
 
         # 5. Aplikowanie widoczności na podstawie zapisanych ustawień
         self._apply_filter_visibility_and_order()
@@ -545,8 +548,8 @@ class FilterPanelController:
         available_filters = self.main_window.ALL_FILTERS.copy()
         
         # Synchronizacja custom widgets jeśli potrzeba (metoda w main)
-        if hasattr(self.main_window, '_synchronize_custom_filter_widgets'):
-            self.main_window._synchronize_custom_filter_widgets()
+        # Synchronizacja custom widgets jeśli potrzeba (metoda w kontrolerze)
+        self.synchronize_custom_filter_widgets()
             
         for col_id, data in self.main_window.custom_columns.items():
             available_filters.append((col_id, f"{data.get('name', col_id)} (Własna)", False))
@@ -569,3 +572,62 @@ class FilterPanelController:
         else:
             # Fallback (gdyby metoda nie istniała, choć powinna)
             log_error("Brak metody main_window.clear_filters()!")
+
+    def synchronize_custom_filter_widgets(self):
+        """
+        Tworzy widgety filtrów dla nowych kolumn niestandardowych i usuwa widgety
+        dla kolumn, które zostały usunięte.
+        """
+        debug_print("[Filtracja] Rozpoczęto synchronizację widgetów filtrów niestandardowych (Controller)...")
+
+        current_col_ids = set(self.main_window.custom_columns.keys())
+        current_map_ids = set(k for k in self.main_window.filter_widget_map.keys() if k.startswith("custom_"))
+
+        # 1. Usuń widgety dla kolumn, które już nie istnieją
+        cols_to_remove = current_map_ids - current_col_ids
+        for col_id in cols_to_remove:
+            debug_print(f"[Filtracja] Usuwanie widgetu filtra dla: {col_id}")
+            widget = self.main_window.filter_widget_map.pop(col_id, None)
+            if widget:
+                widget.setParent(None)
+                widget.deleteLater()
+            # Usuń też z listy widocznych, jeśli tam jest
+            if col_id in self.main_window.visible_filters_list:
+                self.main_window.visible_filters_list.remove(col_id)
+
+        # 2. Dodaj widgety dla nowych kolumn
+        cols_to_add = current_col_ids - current_map_ids
+        for col_id in cols_to_add:
+            col_name = self.main_window.custom_columns[col_id].get('name', col_id)
+            debug_print(f"[Filtracja] Tworzenie widgetu filtra dla: {col_id} (Nazwa: {col_name})")
+
+            # Pobierz nadrzędny widget (filter_container) z self.main_window.filters_layout
+            parent_widget = self.main_window.filters_layout.parentWidget()
+            if not parent_widget:
+                # Fallback, choć layout powinien już być ustawiony w setup_left_panel
+                parent_widget = self.main_window.left_panel_widget 
+                
+            # Użyjemy add_horizontal_filter do stworzenia kontrolek
+            layout, combo, btn = self.add_horizontal_filter(f"{col_name}:", f"filter_combo_{col_id}")
+
+            # Tworzymy widget-kontener z właściwym rodzicem
+            container_widget = QWidget(parent=parent_widget)
+
+            # Ustawiamy rodziców dla elementów layoutu
+            combo.setParent(container_widget)
+            btn.setParent(container_widget)
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item and item.widget():
+                    item.widget().setParent(container_widget)
+
+            container_widget.setLayout(layout)
+            container_widget.setVisible(False)  # Domyślnie ukryty, aż _apply_filter_visibility_and_order go pokaże
+
+            # Zapisujemy kontener w mapie
+            self.main_window.filter_widget_map[col_id] = container_widget
+
+            # Zastosuj styl
+            theme = "dark" if self.main_window.is_dark_theme else "light"
+            # Tu można by zawołać apply_theme, ale standardowo style są aplikowane globalnie lub przy zmianie motywu
+
